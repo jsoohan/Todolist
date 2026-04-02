@@ -1,0 +1,43 @@
+name: Todo Reminder Bot
+
+on:
+  schedule:
+    # 30분마다 실행 (GitHub Actions cron은 UTC 기준)
+    - cron: '*/30 * * * *'
+  workflow_dispatch:  # 수동 트리거용
+
+permissions:
+  contents: write  # todos.json 커밋을 위해 필요
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python bot.py
+
+      - name: Commit state changes
+        run: |
+          git config user.name "todo-bot"
+          git config user.email "bot@github-actions"
+          git add data/todos.json
+          git diff --cached --quiet || git commit -m "🤖 Update todos state [skip ci]"
+          git push
