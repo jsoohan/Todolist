@@ -1,30 +1,45 @@
 #!/usr/bin/env python3
 """
-텔레그램 할일관리 리마인더 봇 (LLM 기반)
-- Claude Haiku로 자연어 이해
-- GitHub Actions 30분 cron
+텔레그램 할일관리 리마인더 봇 (LLM 기반, 즉시응답)
+python-telegram-bot long polling + Claude Haiku + JobQueue 스케줄러
+Railway / Docker 배포용
 """
 
 import json
+import logging
 import os
 import re
 import uuid
-import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 
-import requests
+import httpx
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# ── 로깅 ──────────────────────────────────────────────────
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger(__name__)
 
 # ── 설정 ──────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-API_BASE = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 KST = timezone(timedelta(hours=9))
-DATA_DIR = Path(__file__).parent / "data"
-DATA_FILE = DATA_DIR / "todos.json"
-
 WEEKDAYS_KR = ["월", "화", "수", "목", "금", "토", "일"]
+
+# 데이터 경로: Railway volume mount 시 /data, 로컬이면 ./data
+DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
+DATA_FILE = DATA_DIR / "todos.json"
 
 # ── 프로젝트 키워드 → 태그 ───────────────────────────────
 PROJECT_KEYWORDS: dict[str, str] = {
@@ -51,7 +66,7 @@ def load_data() -> dict:
     if DATA_FILE.exists():
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"last_update_id": 0, "todos": [], "reminder_msg_map": {}}
+    return {"todos": [], "reminder_msg_map": {}}
 
 
 def save_data(data: dict):
@@ -60,47 +75,23 @@ def save_data(data: dict):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-# ══════════════════════════════════════════════════════════
-#  텔레그램 API
-# ══════════════════════════════════════════════════════════
-
-def send_msg(text: str, reply_to: int | None = None) -> int | None:
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
-    if reply_to:
-        payload["reply_to_message_id"] = reply_to
-    try:
-        resp = requests.post(f"{API_BASE}/sendMessage", json=payload, timeout=10)
-        resp.raise_for_status()
-        return resp.json().get("result", {}).get("message_id")
-    except Exception as e:
-        print(f"[ERROR] send_msg: {e}")
-        return None
+# 전역 상태
+STATE = load_data()
 
 
-def get_updates(offset: int = 0) -> list[dict]:
-    params = {"timeout": 5, "allowed_updates": ["message"]}
-    if offset:
-        params["offset"] = offset
-    try:
-        resp = requests.get(f"{API_BASE}/getUpdates", params=params, timeout=15)
-        resp.raise_for_status()
-        return resp.json().get("result", [])
-    except Exception as e:
-        print(f"[ERROR] get_updates: {e}")
-        return []
+def persist():
+    save_data(STATE)
 
 
 # ══════════════════════════════════════════════════════════
-#  Claude API - 메시지 이해 엔진
+#  Claude API - 자연어 이해
 # ══════════════════════════════════════════════════════════
 
-def build_llm_system_prompt(now: datetime, active_todos: list[dict]) -> str:
-    """LLM 시스템 프롬프트 생성. 현재 할일 목록을 컨텍스트로 제공."""
-
-    todo_context = ""
-    if active_todos:
+def build_system_prompt(now: datetime) -> str:
+    active = [t for t in STATE["todos"] if t["status"] in ("active", "pending_input")]
+    if active:
         lines = []
-        for i, t in enumerate(active_todos):
+        for t in active:
             dl = ""
             if t.get("deadline"):
                 try:
@@ -110,103 +101,90 @@ def build_llm_system_prompt(now: datetime, active_todos: list[dict]) -> str:
                     pass
             proj = f" [{t['project']}]" if t.get("project") else ""
             lines.append(f"  #{t['id']} - {t.get('task', '(미입력)')}{dl}{proj}")
-        todo_context = "\n현재 활성 할일:\n" + "\n".join(lines)
+        todo_ctx = "\n현재 활성 할일:\n" + "\n".join(lines)
     else:
-        todo_context = "\n현재 활성 할일: 없음"
+        todo_ctx = "\n현재 활성 할일: 없음"
 
-    return f"""너는 할일 관리 전문 텔레그램 봇이야. 이름은 "할일봇".
+    return f"""너는 할일 관리 전문 텔레그램 봇 "할일봇"이야.
 할일 등록, 완료 처리, 목록 확인만 담당해. 그 외 요청은 정중하게 거절해.
 
 현재 시각: {now.strftime('%Y-%m-%d %H:%M')} KST ({WEEKDAYS_KR[now.weekday()]}요일)
-{todo_context}
+{todo_ctx}
 
-사용자 메시지를 분석해서 반드시 아래 JSON 형식으로만 응답해. JSON 외에 아무것도 출력하지 마.
+사용자 메시지를 분석해서 반드시 아래 JSON만 출력해.
 
 {{
   "intent": "new_todo" | "complete_todo" | "list_todos" | "help" | "modify_todo" | "off_topic",
-  "task": "할일 내용 (new_todo일 때)",
-  "deadline_raw": "사용자가 말한 데드라인 원문 (new_todo일 때)",
-  "deadline_iso": "YYYY-MM-DDTHH:MM:SS+09:00 (파싱 가능하면)",
-  "todo_id": "완료할 할일의 #id (complete_todo일 때)",
-  "reply": "사용자에게 보낼 자연스러운 한국어 답변"
+  "task": "할일 내용 (new_todo)",
+  "deadline_raw": "데드라인 원문 (new_todo)",
+  "deadline_iso": "YYYY-MM-DDTHH:MM:SS+09:00 또는 null",
+  "todo_id": "완료할 할일 #id (complete_todo) 또는 null",
+  "reply": "사용자에게 보낼 한국어 답변"
 }}
 
 규칙:
 1. intent 판단:
-   - 할일/과제/업무를 등록하려는 의도 → "new_todo"
-   - "다했다", "끝", "완료", "처리했어" 등 완료 표현 → "complete_todo"
+   - 할일/과제/업무 등록 → "new_todo"
+   - "다했다", "끝", "완료", "처리했어" 등 → "complete_todo"
    - "뭐 남았어?", "할일 알려줘", "목록" → "list_todos"
    - 사용법 질문 → "help"
-   - 기존 할일 수정/데드라인 변경 → "modify_todo" (현재 미지원이라 reply에서 안내)
-   - 할일과 무관한 대화 → "off_topic"
+   - 기존 할일 수정 → "modify_todo"
+   - 할일 무관 → "off_topic"
 
 2. new_todo:
-   - 다양한 표현을 이해해: "내일까지 보고서 써야돼", "FDD 이번주 금요일까지 끝내자", "4/10 ASIABNC 제안서", "듀이트리 재무검토 좀 해야하는데 수요일까지"
-   - task: 핵심 할일만 깔끔하게 추출 (데드라인 부분 제외)
-   - deadline_raw: 사용자가 말한 시간 표현 원문
-   - deadline_iso: 현재 시각 기준으로 절대 시각 계산. 시간 미지정 시 해당일 23:59. "이번주 금요일" = 이번주 돌아오는 금요일, "다음주 월요일" = 다음주 월요일
-   - 데드라인을 파악할 수 없으면 deadline_iso를 null로
-   - task를 파악할 수 없으면 task를 null로
-   - reply: 등록 확인 메시지 (친근하게)
+   - 다양한 표현 이해: "FDD 이번주 금요일까지 끝내자", "내일까지 보고서 써야돼"
+   - task: 핵심 할일만 (데드라인 제외)
+   - deadline_iso: 현재 시각 기준 절대 시각. 시간 미지정 → 해당일 23:59
+   - 파악 불가 시 null
 
 3. complete_todo:
-   - 현재 활성 할일 중에서 매칭. 메시지 내용이나 맥락으로 어떤 할일인지 추론
-   - 특정할 수 없으면 todo_id를 null로 하고 reply에서 어떤 건지 물어봐
-   - 활성 할일이 1개뿐이면 그걸로 매칭
+   - 활성 할일 중 매칭. 특정 불가 시 todo_id=null, reply에서 질문
+   - 활성 1개면 자동 매칭
 
 4. off_topic:
-   - reply에 "저는 할일 관리 전문 봇이에요 😊" 같은 정중한 거절
-   - 유머 있게 해도 좋아. 하지만 짧게.
+   - "저는 할일 관리 전문 봇이에요 😊" 등 정중한 거절. 짧게.
 
-5. reply 작성 규칙:
-   - 반말/존댓말은 사용자에 맞춰
-   - 간결하게. 3줄 이내.
-   - HTML 태그 사용 가능: <b>, <i>, <code>"""
+5. reply: 반말/존댓말 사용자 맞춤. 간결하게 3줄 이내. HTML 태그 가능: <b>, <i>, <code>"""
 
 
-def ask_llm(user_text: str, now: datetime, active_todos: list[dict]) -> dict | None:
-    """Claude Haiku에 메시지 분석 요청."""
+async def ask_llm(text: str, now: datetime) -> dict | None:
     if not ANTHROPIC_KEY:
-        print("[WARN] ANTHROPIC_API_KEY 없음. LLM 비활성.")
+        log.warning("ANTHROPIC_API_KEY 없음")
         return None
 
-    system = build_llm_system_prompt(now, active_todos)
-
+    system = build_system_prompt(now)
     try:
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 500,
-                "system": system,
-                "messages": [{"role": "user", "content": user_text}],
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        content = resp.json().get("content", [])
-        text = "".join(c.get("text", "") for c in content).strip()
-
-        # JSON 추출 (마크다운 코드블록 제거)
-        text = re.sub(r"^```json\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-
-        return json.loads(text)
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 500,
+                    "system": system,
+                    "messages": [{"role": "user", "content": text}],
+                },
+            )
+            resp.raise_for_status()
+            content = resp.json().get("content", [])
+            raw = "".join(c.get("text", "") for c in content).strip()
+            raw = re.sub(r"^```json\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+            return json.loads(raw)
     except json.JSONDecodeError as e:
-        print(f"[ERROR] LLM JSON 파싱 실패: {e}\nraw: {text[:200]}")
+        log.error(f"LLM JSON 파싱 실패: {e}")
         return None
     except Exception as e:
-        print(f"[ERROR] LLM 호출 실패: {e}")
+        log.error(f"LLM 호출 실패: {e}")
         return None
 
 
 # ══════════════════════════════════════════════════════════
-#  프로젝트 태깅 & 유틸
+#  유틸
 # ══════════════════════════════════════════════════════════
 
 def detect_project(text: str) -> str | None:
@@ -223,70 +201,81 @@ def format_deadline(deadline_iso: str, now: datetime) -> str:
         diff = dl - now
         hours = diff.total_seconds() / 3600
         wday = WEEKDAYS_KR[dl.weekday()]
-        date_str = f"{dl.month}/{dl.day}({wday}) {dl.strftime('%H:%M')}"
+        ds = f"{dl.month}/{dl.day}({wday}) {dl.strftime('%H:%M')}"
 
         if hours < 0:
-            return f"⚠️ {date_str} (기한 초과!)"
+            return f"⚠️ {ds} (기한 초과!)"
         elif hours < 1:
-            return f"🔴 {date_str} ({int(diff.total_seconds()/60)}분 남음)"
+            return f"🔴 {ds} ({int(diff.total_seconds()/60)}분 남음)"
         elif hours < 12:
-            return f"🔴 {date_str} ({hours:.0f}시간 남음)"
+            return f"🔴 {ds} ({hours:.0f}시간 남음)"
         elif hours < 24:
-            return f"🟡 {date_str} ({hours:.0f}시간 남음)"
+            return f"🟡 {ds} ({hours:.0f}시간 남음)"
         elif diff.days < 3:
-            return f"🟡 {date_str} ({diff.days}일 {int(hours%24)}시간 남음)"
+            return f"🟡 {ds} ({diff.days}일 {int(hours%24)}시간 남음)"
         else:
-            return f"🟢 {date_str} ({diff.days}일 남음)"
+            return f"🟢 {ds} ({diff.days}일 남음)"
     except Exception:
         return deadline_iso
 
 
 # ══════════════════════════════════════════════════════════
-#  메시지 처리
+#  텔레그램 핸들러
 # ══════════════════════════════════════════════════════════
 
-def process_message(msg: dict, data: dict, now: datetime):
-    text = msg.get("text", "").strip()
-    if not text:
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_html(
+        "👋 안녕하세요! <b>할일봇</b>입니다.\n\n"
+        "할일을 자유롭게 말씀해주세요.\n"
+        "예: <code>내일까지 FDD 보고서 마무리해야돼</code>\n\n"
+        "완료하면 리마인더에 답장으로 <code>다했다</code>라고 보내주세요."
+    )
+
+
+async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(KST)
+    await send_summary(ctx.bot, now, force=True)
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_html(
+        "📋 <b>할일봇 사용법</b>\n\n"
+        "✏️ <b>등록:</b> 자유롭게 말하면 됩니다\n"
+        "  <code>내일까지 FDD 보고서 마무리해야돼</code>\n"
+        "  <code>금요일까지 듀이트리 재무검토</code>\n\n"
+        "✅ <b>완료:</b> 리마인더에 답장 → 완료 / 다했다 / 끝\n"
+        "📋 /list — 할일 목록\n"
+        "❓ /help — 이 도움말"
+    )
+
+
+async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """모든 텍스트 메시지를 LLM으로 분석해서 처리."""
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    if msg.chat_id != CHAT_ID:
         return
 
-    chat_id = str(msg.get("chat", {}).get("id", ""))
-    if chat_id != str(CHAT_ID):
-        return
+    text = msg.text.strip()
+    now = datetime.now(KST)
 
-    msg_id = msg.get("message_id")
-
-    # /start는 LLM 안 거치고 바로 처리
-    if text.lower() == "/start":
-        send_msg(
-            "👋 안녕하세요! <b>할일봇</b>입니다.\n\n"
-            "할일을 자유롭게 말씀해주세요.\n"
-            "예: <code>내일까지 FDD 보고서 마무리해야돼</code>\n\n"
-            "완료하면 리마인더에 답장으로 <code>다했다</code> 하시면 됩니다.",
-            reply_to=msg_id,
-        )
-        return
-
-    # ── LLM 분석 ──
-    active_todos = [t for t in data["todos"] if t["status"] in ("active", "pending_input")]
-    result = ask_llm(text, now, active_todos)
-
+    result = await ask_llm(text, now)
     if not result:
-        # LLM 실패 시 기본 안내
-        send_msg("🤖 잠시 문제가 생겼어요. 다시 말씀해주세요.", reply_to=msg_id)
+        await msg.reply_html("🤖 잠시 문제가 생겼어요. 다시 말씀해주세요.")
         return
 
     intent = result.get("intent", "off_topic")
     reply = result.get("reply", "")
-    print(f"[LLM] intent={intent} | {text[:50]}")
+    log.info(f"[LLM] intent={intent} | {text[:60]}")
 
-    # ── new_todo ──────────────────────────────────────
+    # ── new_todo ──
     if intent == "new_todo":
         task = result.get("task")
         deadline_iso = result.get("deadline_iso")
-        project = detect_project(text)  # 키워드 기반 (LLM 대신 확정적)
-
+        project = detect_project(text)
         has_all = bool(task and deadline_iso)
+
         todo = {
             "id": str(uuid.uuid4())[:8],
             "task": task,
@@ -299,9 +288,9 @@ def process_message(msg: dict, data: dict, now: datetime):
             "last_daily_date": None,
             "original_message": text,
         }
-        data["todos"].append(todo)
+        STATE["todos"].append(todo)
+        persist()
 
-        # 응답 구성: LLM reply + 구조화 정보
         lines = [reply] if reply else ["📝 등록했습니다."]
         if task:
             lines.append(f"\n📌 <b>{task}</b>")
@@ -317,66 +306,53 @@ def process_message(msg: dict, data: dict, now: datetime):
                 missing.append("데드라인")
             lines.append(f"\n⚠️ {', '.join(missing)}이 부족해요. 알려주시면 업데이트할게요.")
 
-        send_msg("\n".join(lines), reply_to=msg_id)
-        print(f"[NEW] {task} → {deadline_iso}")
+        await msg.reply_html("\n".join(lines))
 
-    # ── complete_todo ─────────────────────────────────
+    # ── complete_todo ──
     elif intent == "complete_todo":
-        todo_id = result.get("todo_id")
+        active = [t for t in STATE["todos"] if t["status"] == "active"]
         matched = None
 
-        # LLM이 ID를 지정한 경우
+        # LLM 지정 ID
+        todo_id = result.get("todo_id")
         if todo_id:
-            for t in active_todos:
-                if t["id"] == todo_id:
-                    matched = t
-                    break
+            matched = next((t for t in active if t["id"] == todo_id), None)
 
-        # 답장 기반 매칭 (LLM이 못 찾았을 때 보완)
-        if not matched:
-            reply_mid = str(msg.get("reply_to_message", {}).get("message_id", ""))
-            if reply_mid and reply_mid in data.get("reminder_msg_map", {}):
-                target_id = data["reminder_msg_map"][reply_mid]
-                for t in active_todos:
-                    if t["id"] == target_id:
-                        matched = t
-                        break
+        # 답장 기반 매칭
+        if not matched and msg.reply_to_message:
+            reply_mid = str(msg.reply_to_message.message_id)
+            target_id = STATE.get("reminder_msg_map", {}).get(reply_mid)
+            if target_id:
+                matched = next((t for t in active if t["id"] == target_id), None)
 
         # 활성 1개면 자동
-        if not matched and len([t for t in active_todos if t["status"] == "active"]) == 1:
-            matched = [t for t in active_todos if t["status"] == "active"][0]
+        if not matched and len(active) == 1:
+            matched = active[0]
 
         if matched:
             matched["status"] = "done"
             matched["done_at"] = now.isoformat()
-            task_name = matched.get("task", "할일")
-            if reply:
-                send_msg(reply, reply_to=msg_id)
-            else:
-                send_msg(f"✅ <b>{task_name}</b> 완료!", reply_to=msg_id)
-            print(f"[DONE] {task_name}")
+            persist()
+            await msg.reply_html(reply or f"✅ <b>{matched.get('task', '할일')}</b> 완료!")
+            log.info(f"[DONE] {matched.get('task')}")
         else:
-            send_msg(reply or "🤔 어떤 할일을 완료하셨나요? 리마인더에 답장으로 알려주세요.", reply_to=msg_id)
+            await msg.reply_html(reply or "🤔 어떤 할일을 완료하셨나요? 리마인더에 답장으로 알려주세요.")
 
-    # ── list_todos ────────────────────────────────────
+    # ── list_todos ──
     elif intent == "list_todos":
-        send_daily_summary(data, now, force=True)
+        await send_summary(ctx.bot, now, force=True)
 
-    # ── help ──────────────────────────────────────────
+    # ── help, modify, off_topic ──
     elif intent == "help":
-        send_msg(reply or "자유롭게 할일을 말씀해주세요. 완료 시 '다했다'라고 답장하면 됩니다.", reply_to=msg_id)
-
-    # ── modify_todo ───────────────────────────────────
+        await msg.reply_html(reply or "자유롭게 할일을 말씀해주세요!")
     elif intent == "modify_todo":
-        send_msg(reply or "⚠️ 할일 수정은 아직 준비 중이에요. 완료 후 새로 등록해주세요.", reply_to=msg_id)
-
-    # ── off_topic ─────────────────────────────────────
+        await msg.reply_html(reply or "⚠️ 수정은 아직 준비 중이에요. 완료 후 새로 등록해주세요.")
     else:
-        send_msg(reply or "저는 할일 관리 전문 봇이에요 😊 할일이 있으시면 알려주세요!", reply_to=msg_id)
+        await msg.reply_html(reply or "저는 할일 관리 전문 봇이에요 😊")
 
 
 # ══════════════════════════════════════════════════════════
-#  리마인더 로직 (LLM 불필요 — 규칙 기반)
+#  리마인더 스케줄러 (JobQueue)
 # ══════════════════════════════════════════════════════════
 
 def get_reminder_interval(deadline_iso: str, now: datetime) -> float | None:
@@ -395,79 +371,89 @@ def get_reminder_interval(deadline_iso: str, now: datetime) -> float | None:
         return None
 
 
-def should_remind(todo: dict, now: datetime) -> bool:
-    if todo["status"] != "active" or not todo.get("deadline"):
-        return False
-    interval = get_reminder_interval(todo["deadline"], now)
-    if interval is None:
-        if now.hour < 7 or now.hour > 9:
-            return False
-        if todo.get("last_daily_date") == now.strftime("%Y-%m-%d"):
-            return False
-        return True
-    else:
-        if todo.get("last_reminded_at"):
-            elapsed = (now - datetime.fromisoformat(todo["last_reminded_at"])).total_seconds() / 3600
-            if elapsed < interval - 0.5:
-                return False
-        return True
+async def reminder_check(ctx: ContextTypes.DEFAULT_TYPE):
+    """5분마다 실행: 리마인더 발송 판단."""
+    now = datetime.now(KST)
+
+    for todo in STATE["todos"]:
+        # ── 활성 할일 리마인더 ──
+        if todo["status"] == "active" and todo.get("deadline"):
+            interval = get_reminder_interval(todo["deadline"], now)
+
+            if interval is None:
+                # 24시간 이상 → 매일 아침 8시
+                if now.hour < 7 or now.hour > 9:
+                    continue
+                if todo.get("last_daily_date") == now.strftime("%Y-%m-%d"):
+                    continue
+            else:
+                # N시간 간격
+                if todo.get("last_reminded_at"):
+                    elapsed = (now - datetime.fromisoformat(todo["last_reminded_at"])).total_seconds() / 3600
+                    if elapsed < interval - 0.1:
+                        continue
+
+            # 리마인더 전송
+            dl_str = format_deadline(todo["deadline"], now)
+            proj = f"\n📁 {todo['project']}" if todo.get("project") else ""
+            sent = await ctx.bot.send_message(
+                chat_id=CHAT_ID,
+                text=(
+                    f"⏰ <b>리마인더</b>\n\n"
+                    f"📌 {todo['task']}\n"
+                    f"⏳ {dl_str}{proj}\n\n"
+                    f"<i>완료하셨으면 이 메시지에 답장으로 알려주세요.</i>"
+                ),
+                parse_mode="HTML",
+            )
+            todo["last_reminded_at"] = now.isoformat()
+            todo["last_daily_date"] = now.strftime("%Y-%m-%d")
+            STATE.setdefault("reminder_msg_map", {})[str(sent.message_id)] = todo["id"]
+            persist()
+            log.info(f"[REMIND] {todo['task']}")
+
+        # ── 미완성 입력 리마인더 (매 시간 정각) ──
+        elif todo["status"] == "pending_input":
+            if 10 < now.minute < 50:
+                continue
+            if todo.get("last_reminded_at"):
+                elapsed = (now - datetime.fromisoformat(todo["last_reminded_at"])).total_seconds()
+                if elapsed < 3000:
+                    continue
+
+            missing = []
+            if not todo.get("task"):
+                missing.append("할일 내용")
+            if not todo.get("deadline"):
+                missing.append("데드라인")
+
+            await ctx.bot.send_message(
+                chat_id=CHAT_ID,
+                text=(
+                    f"⚠️ <b>입력 미완성</b>\n\n"
+                    f"원본: <code>{todo.get('original_message', '?')}</code>\n"
+                    f"부족: {', '.join(missing)}\n\n"
+                    f"예: <code>내일까지 보고서 작성</code>"
+                ),
+                parse_mode="HTML",
+            )
+            todo["last_reminded_at"] = now.isoformat()
+            persist()
+            log.info(f"[PENDING] {todo.get('original_message')}")
 
 
-def should_remind_pending(todo: dict, now: datetime) -> bool:
-    if todo["status"] != "pending_input":
-        return False
-    if 15 < now.minute < 45:
-        return False
-    if todo.get("last_reminded_at"):
-        if (now - datetime.fromisoformat(todo["last_reminded_at"])).total_seconds() < 3000:
-            return False
-    return True
+async def daily_summary(ctx: ContextTypes.DEFAULT_TYPE):
+    """매일 아침 7시 KST 실행."""
+    now = datetime.now(KST)
+    await send_summary(ctx.bot, now, force=True)
 
 
-def send_reminder(todo: dict, data: dict, now: datetime):
-    dl_str = format_deadline(todo["deadline"], now)
-    proj = f"\n📁 {todo['project']}" if todo.get("project") else ""
-
-    sent_id = send_msg(
-        f"⏰ <b>리마인더</b>\n\n"
-        f"📌 {todo['task']}\n"
-        f"⏳ {dl_str}{proj}\n\n"
-        f"<i>완료하셨으면 이 메시지에 답장으로 알려주세요.</i>"
-    )
-    todo["last_reminded_at"] = now.isoformat()
-    todo["last_daily_date"] = now.strftime("%Y-%m-%d")
-    if sent_id:
-        data.setdefault("reminder_msg_map", {})[str(sent_id)] = todo["id"]
-    print(f"[REMIND] {todo['task']}")
-
-
-def send_pending_remind(todo: dict, now: datetime):
-    missing = []
-    if not todo.get("task"):
-        missing.append("할일 내용")
-    if not todo.get("deadline"):
-        missing.append("데드라인")
-    send_msg(
-        f"⚠️ <b>입력 미완성</b>\n\n"
-        f"원본: <code>{todo.get('original_message', '?')}</code>\n"
-        f"부족: {', '.join(missing)}\n\n"
-        f"예: <code>내일까지 보고서 작성</code> 형태로 보내주세요."
-    )
-    todo["last_reminded_at"] = now.isoformat()
-    print(f"[PENDING] {todo.get('original_message')}")
-
-
-def send_daily_summary(data: dict, now: datetime, force: bool = False):
-    if not force:
-        if now.hour != 7 or now.minute > 30:
-            return
-        if data.get("last_summary_date") == now.strftime("%Y-%m-%d"):
-            return
-
-    active = [t for t in data["todos"] if t["status"] in ("active", "pending_input")]
+async def send_summary(bot, now: datetime, force: bool = False):
+    """전체 할일 요약 전송."""
+    active = [t for t in STATE["todos"] if t["status"] in ("active", "pending_input")]
     if not active:
         if force:
-            send_msg("📭 활성 할일이 없습니다. 한가하시네요! 😎")
+            await bot.send_message(chat_id=CHAT_ID, text="📭 활성 할일이 없습니다. 한가하시네요! 😎")
         return
 
     def sort_key(t):
@@ -505,64 +491,63 @@ def send_daily_summary(data: dict, now: datetime, force: bool = False):
                 lines.append(f"  • {task}{proj}\n    ⚠️ 데드라인 미설정")
         lines.append("")
 
-    lines.append(f"총 {len(active)}건")
-    send_msg("\n".join(lines))
-    data["last_summary_date"] = now.strftime("%Y-%m-%d")
-    print(f"[SUMMARY] {len(active)}건")
+    lines.append(f"총 {len(active)}건 | /list")
+    await bot.send_message(chat_id=CHAT_ID, text="\n".join(lines), parse_mode="HTML")
+    log.info(f"[SUMMARY] {len(active)}건")
 
 
-# ══════════════════════════════════════════════════════════
-#  정리 & 메인
-# ══════════════════════════════════════════════════════════
-
-def cleanup(data: dict, now: datetime):
+async def cleanup_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """매일 자정: 7일 지난 완료 항목 정리."""
+    now = datetime.now(KST)
     cutoff = now - timedelta(days=7)
-    data["todos"] = [
-        t for t in data["todos"]
+    before = len(STATE["todos"])
+    STATE["todos"] = [
+        t for t in STATE["todos"]
         if not (t["status"] == "done" and t.get("done_at") and datetime.fromisoformat(t["done_at"]) < cutoff)
     ]
-    if len(data.get("reminder_msg_map", {})) > 100:
-        ids = {t["id"] for t in data["todos"]}
-        data["reminder_msg_map"] = {k: v for k, v in data["reminder_msg_map"].items() if v in ids}
+    # 오래된 매핑 정리
+    if len(STATE.get("reminder_msg_map", {})) > 200:
+        ids = {t["id"] for t in STATE["todos"]}
+        STATE["reminder_msg_map"] = {k: v for k, v in STATE["reminder_msg_map"].items() if v in ids}
+    persist()
+    log.info(f"[CLEANUP] {before} → {len(STATE['todos'])}건")
 
+
+# ══════════════════════════════════════════════════════════
+#  메인
+# ══════════════════════════════════════════════════════════
 
 def main():
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("[ERROR] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 필요")
-        sys.exit(1)
-    if not ANTHROPIC_KEY:
-        print("[WARN] ANTHROPIC_API_KEY 없음. LLM 기능 비활성화.")
+    log.info("=== 할일봇 시작 ===")
+    log.info(f"CHAT_ID: {CHAT_ID}")
+    log.info(f"DATA_DIR: {DATA_DIR}")
+    log.info(f"LLM: {'활성' if ANTHROPIC_KEY else '비활성'}")
+    log.info(f"활성 할일: {len([t for t in STATE['todos'] if t['status'] == 'active'])}건")
 
-    now = datetime.now(KST)
-    print(f"\n{'='*50}")
-    print(f"[RUN] {now.strftime('%Y-%m-%d %H:%M:%S KST')}")
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    data = load_data()
+    # 커맨드 핸들러
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("help", cmd_help))
 
-    # 1) 새 메시지 폴링
-    offset = data.get("last_update_id", 0)
-    updates = get_updates(offset + 1 if offset else 0)
-    print(f"[POLL] {len(updates)}건")
+    # 모든 텍스트 메시지 → LLM 분석
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    for update in updates:
-        data["last_update_id"] = update["update_id"]
-        if m := update.get("message"):
-            process_message(m, data, now)
+    # 스케줄 잡 등록
+    jq = app.job_queue
 
-    # 2) 매일 7시 요약
-    send_daily_summary(data, now)
+    # 리마인더 체크: 5분마다
+    jq.run_repeating(reminder_check, interval=300, first=30)
 
-    # 3) 리마인더
-    for todo in data["todos"]:
-        if should_remind(todo, now):
-            send_reminder(todo, data, now)
-        elif should_remind_pending(todo, now):
-            send_pending_remind(todo, now)
+    # 매일 아침 7시 KST 요약 (UTC 22:00 = KST 07:00)
+    jq.run_daily(daily_summary, time=time(hour=22, minute=0, tzinfo=timezone.utc))
 
-    # 4) 정리 & 저장
-    cleanup(data, now)
-    save_data(data)
-    print(f"[SAVE] {len(data['todos'])}건")
+    # 매일 자정 정리 (UTC 15:00 = KST 00:00)
+    jq.run_daily(cleanup_job, time=time(hour=15, minute=0, tzinfo=timezone.utc))
+
+    log.info("Long polling 시작...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 
 if __name__ == "__main__":
