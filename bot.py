@@ -169,14 +169,16 @@ async def ask_llm(text: str, now: datetime) -> dict | None:
                     "messages": [{"role": "user", "content": text}],
                 },
             )
-            resp.raise_for_status()
+            if resp.status_code != 200:
+                log.error(f"LLM API {resp.status_code}: {resp.text}")
+                return None
             content = resp.json().get("content", [])
             raw = "".join(c.get("text", "") for c in content).strip()
             raw = re.sub(r"^```json\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
             return json.loads(raw)
     except json.JSONDecodeError as e:
-        log.error(f"LLM JSON 파싱 실패: {e}")
+        log.error(f"LLM JSON 파싱 실패: {e}\nraw: {raw[:300]}")
         return None
     except Exception as e:
         log.error(f"LLM 호출 실패: {e}")
