@@ -126,7 +126,7 @@ def build_system_prompt(now: datetime) -> str:
         todo_ctx = "\n현재 활성 할일: 없음"
 
     return f"""너는 할일 관리 전문 텔레그램 봇 "할일봇"이야.
-할일 등록, 완료 처리, 기한 변경, 삭제, 목록 확인을 담당해. 그 외 요청은 정중하게 거절.
+할일 등록, 완료, 기한 변경, 삭제, 일괄 처리, 목록 확인을 담당해. 그 외 요청은 정중하게 거절.
 
 현재 시각: {now.strftime('%Y-%m-%d %H:%M')} KST ({WEEKDAYS_KR[now.weekday()]}요일)
 {todo_ctx}
@@ -134,45 +134,52 @@ def build_system_prompt(now: datetime) -> str:
 반드시 아래 JSON만 출력. JSON 외 텍스트 절대 금지.
 
 {{
-  "intent": "new_todo" | "complete_todo" | "modify_todo" | "delete_todo" | "list_todos" | "help" | "off_topic",
-  "task": "할일 내용 (new_todo일 때만)",
+  "intent": "new_todo" | "complete_todo" | "modify_todo" | "delete_todo" | "batch" | "list_todos" | "help" | "off_topic",
+  "task": "할일 내용 (new_todo)",
   "deadline_raw": "데드라인 원문 (new_todo, modify_todo)",
   "deadline_iso": "YYYY-MM-DDTHH:MM:SS+09:00 또는 null",
-  "todo_id": "대상 할일의 #id 또는 null",
+  "todo_id": "대상 #id 또는 null (단건 처리)",
+  "batch_action": "complete" | "delete" | "modify" (batch일 때),
+  "batch_ids": ["id1", "id2"] (batch일 때 대상 ID 배열),
+  "batch_filter": "all" | "overdue" | null (batch일 때 필터),
   "reply": "한국어 답변"
 }}
 
 핵심 규칙:
 
 1. **reply_context 처리 (가장 중요):**
-   사용자 메시지에 [reply_context: #ID - 할일이름] 이 붙어있으면, 사용자가 특정 리마인더에 답장한 것.
-   "이건", "이거", "이 할일", 주어 없는 문장 → 전부 reply_context의 할일을 가리킴.
-   반드시 todo_id에 해당 ID를 넣어.
-   
-   예시:
-   - reply_context: #abc1 - 듀이트리 아마란스 보고
-   - "이건 더 안봐도 돼" → intent: complete_todo, todo_id: "abc1"
-   - "이거 기한 토요일까지로 늘려줘" → intent: modify_todo, todo_id: "abc1", deadline_iso 계산
-   - "삭제해" → intent: delete_todo, todo_id: "abc1"
+   [reply_context: #ID - 할일이름] → 사용자가 특정 리마인더에 답장한 것.
+   "이건", "이거", 주어 없는 문장 → reply_context의 할일.
+   반드시 todo_id에 해당 ID.
 
 2. **intent 판단:**
-   - 새 할일 등록 → "new_todo"
-   - 완료 표현: "다했다", "끝", "완료", "더 안봐도 돼", "됐어", "처리했어", "안해도 돼" → "complete_todo"
-   - 기한 변경: "늘려줘", "줄여줘", "연장", "기한 변경", "까지로 바꿔" → "modify_todo"
-   - 삭제: "삭제해", "취소해", "빼줘" → "delete_todo"
-   - 목록: "뭐 남았어?", "할일", "목록" → "list_todos"
+   - 새 할일 → "new_todo"
+   - 완료: "다했다", "끝", "더 안봐도 돼", "됐어" → "complete_todo"
+   - 기한 변경: "늘려줘", "연장", "기한 변경" → "modify_todo"
+   - 삭제 단건: "삭제해", "취소해" → "delete_todo"
+   - **일괄 처리**: "모두/전부/다 삭제", "기한 초과 전부 삭제", "할일 초기화", "전부 완료" → "batch"
+   - 목록 → "list_todos"
    - 사용법 → "help"
    - 할일 무관 → "off_topic"
 
-3. **new_todo:** task=핵심만, deadline_iso=절대시각(미지정→23:59), 파악불가→null
+3. **batch (일괄 처리):**
+   - "할일 모두 삭제해줘" / "전부 삭제" / "초기화" → batch_action: "delete", batch_filter: "all"
+   - "기한 초과된 것 다 삭제" → batch_action: "delete", batch_filter: "overdue"
+   - "전부 완료 처리해" → batch_action: "complete", batch_filter: "all"
+   - "PNK랑 딜로이트 삭제해" → batch_action: "delete", batch_ids: [해당 id들]
+   - "PNK랑 그린우드 완료" → batch_action: "complete", batch_ids: [해당 id들]
+   - batch_filter와 batch_ids 중 하나만 사용. 둘 다 있으면 batch_ids 우선.
+   - reply에 처리 결과 미리 작성.
 
-4. **complete_todo:** reply_context 있으면 그 ID. 없으면 메시지로 매칭. 1개면 자동. 못 찾으면 null+reply에서 질문.
+4. **new_todo:** task=핵심만, deadline_iso=절대시각(미지정→23:59), 파악불가→null
 
-5. **modify_todo:** todo_id + deadline_iso 필수. "이번주 토요일" = 이번 주 토요일 23:59.
+5. **complete_todo:** reply_context 있으면 그 ID. 없으면 메시지로 매칭. 1개면 자동.
 
-6. **delete_todo:** todo_id 필수.
+6. **modify_todo:** todo_id + deadline_iso 필수. "이번주 토요일" = 이번 주 토요일 23:59.
 
-7. **reply:** 반말/존댓말 맞춤. 간결 3줄. HTML <b><i><code> 가능."""
+7. **delete_todo:** todo_id 필수.
+
+8. **reply:** 반말/존댓말 맞춤. 간결 3줄. HTML <b><i><code> 가능."""
 
 
 def build_user_message(text: str, reply_todo: dict | None) -> str:
@@ -288,7 +295,10 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "✏️ <b>등록:</b> 자유롭게 말하기\n"
         "✅ <b>완료:</b> 리마인더 답장 → <code>다했다</code> / <code>이건 됐어</code>\n"
         "📅 <b>기한변경:</b> 리마인더 답장 → <code>금요일까지로 늘려줘</code>\n"
-        "🗑️ <b>삭제:</b> 리마인더 답장 → <code>삭제해</code>\n"
+        "🗑️ <b>삭제:</b> 리마인더 답장 → <code>삭제해</code>\n\n"
+        "🔄 <b>일괄:</b>\n"
+        "  <code>할일 모두 삭제</code> / <code>기한 초과 전부 삭제</code>\n"
+        "  <code>PNK랑 딜로이트 완료 처리</code>\n\n"
         "📋 /list — 목록  ❓ /help — 도움말"
     )
 
@@ -426,6 +436,54 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             log.info(f"[DELETE] {matched.get('task')}")
         else:
             await msg.reply_html(reply or "🤔 어떤 할일? 리마인더에 답장으로 알려주세요.")
+
+    # ── batch (일괄 처리) ──
+    elif intent == "batch":
+        batch_action = result.get("batch_action", "delete")
+        batch_ids = result.get("batch_ids") or []
+        batch_filter = result.get("batch_filter")
+        new_deadline = result.get("deadline_iso")
+
+        active = [t for t in STATE["todos"] if t["status"] in ("active", "pending_input")]
+
+        # 대상 결정
+        targets = []
+        if batch_ids:
+            for bid in batch_ids:
+                t = find_todo_by_id(bid)
+                if t:
+                    targets.append(t)
+        elif batch_filter == "all":
+            targets = active
+        elif batch_filter == "overdue":
+            targets = [t for t in active if t.get("deadline") and datetime.fromisoformat(t["deadline"]) < now]
+
+        if not targets:
+            await msg.reply_html(reply or "🤔 대상 할일을 찾지 못했어요.")
+        else:
+            names = []
+            for t in targets:
+                if batch_action == "delete":
+                    t["status"] = "deleted"
+                    t["done_at"] = now.isoformat()
+                elif batch_action == "complete":
+                    t["status"] = "done"
+                    t["done_at"] = now.isoformat()
+                elif batch_action == "modify" and new_deadline:
+                    t["deadline"] = new_deadline
+                    t["deadline_display"] = result.get("deadline_raw")
+                    t["last_reminded_at"] = None
+                    t["last_daily_date"] = None
+                names.append(t.get("task", "?"))
+            persist()
+
+            action_emoji = {"delete": "🗑️", "complete": "✅", "modify": "📅"}.get(batch_action, "✅")
+            action_word = {"delete": "삭제", "complete": "완료", "modify": "기한 변경"}.get(batch_action, "처리")
+            items_str = "\n".join(f"  • {n}" for n in names)
+            await msg.reply_html(
+                reply or f"{action_emoji} <b>{len(targets)}건 {action_word}</b>\n\n{items_str}"
+            )
+            log.info(f"[BATCH] {batch_action} {len(targets)}건")
 
     # ── list_todos ──
     elif intent == "list_todos":
