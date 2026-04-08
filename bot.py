@@ -114,21 +114,26 @@ def build_system_prompt(now: datetime) -> str:
     if active:
         lines = []
         for t in active:
-            dl = ""
-            if t.get("deadline"):
-                try:
-                    dt = datetime.fromisoformat(t["deadline"])
-                    dl = f" (마감: {dt.month}/{dt.day} {dt.strftime('%H:%M')})"
-                except Exception:
-                    pass
-            proj = f" [{t['project']}]" if t.get("project") else ""
-            lines.append(f"  #{t['id']} - {t.get('task', '(미입력)')}{dl}{proj}")
+            if t.get("type") == "recurring":
+                rt = t.get("reminder_time", "19:00")
+                proj = f" [{t['project']}]" if t.get("project") else ""
+                lines.append(f"  #{t['id']} - {t.get('task', '(미입력)')} (매일 {rt} 반복){proj}")
+            else:
+                dl = ""
+                if t.get("deadline"):
+                    try:
+                        dt = datetime.fromisoformat(t["deadline"])
+                        dl = f" (마감: {dt.month}/{dt.day} {dt.strftime('%H:%M')})"
+                    except Exception:
+                        pass
+                proj = f" [{t['project']}]" if t.get("project") else ""
+                lines.append(f"  #{t['id']} - {t.get('task', '(미입력)')}{dl}{proj}")
         todo_ctx = "\n현재 활성 할일:\n" + "\n".join(lines)
     else:
         todo_ctx = "\n현재 활성 할일: 없음"
 
     return f"""너는 할일 관리 전문 텔레그램 봇 "할일봇"이야.
-할일 등록, 완료, 기한 변경, 삭제, 일괄 처리, 목록 확인을 담당해. 그 외 요청은 정중하게 거절.
+할일 등록, 완료, 기한 변경, 삭제, 일괄 처리, 목록 확인, 장기/반복 프로젝트 관리를 담당해. 그 외 요청은 정중하게 거절.
 
 현재 시각: {now.strftime('%Y-%m-%d %H:%M')} KST ({WEEKDAYS_KR[now.weekday()]}요일)
 {todo_ctx}
@@ -136,14 +141,16 @@ def build_system_prompt(now: datetime) -> str:
 반드시 아래 JSON만 출력. JSON 외 텍스트 절대 금지.
 
 {{
-  "intent": "new_todo" | "complete_todo" | "modify_todo" | "delete_todo" | "batch" | "list_todos" | "help" | "off_topic",
+  "intent": "new_todo" | "new_recurring" | "complete_todo" | "modify_todo" | "delete_todo" | "batch" | "list_todos" | "help" | "off_topic",
   "task": "할일 내용 (new_todo)",
+  "tasks": [{{"task": "할일1"}}, {{"task": "할일2"}}],
+  "reminder_time": "HH:MM (KST, new_recurring)",
   "deadline_raw": "데드라인 원문 (new_todo, modify_todo)",
   "deadline_iso": "YYYY-MM-DDTHH:MM:SS+09:00 또는 null",
   "todo_id": "대상 #id 또는 null (단건 처리)",
   "batch_action": "complete" | "delete" | "modify" (batch일 때),
   "batch_ids": ["id1", "id2"] (batch일 때 대상 ID 배열),
-  "batch_filter": "all" | "overdue" | null (batch일 때 필터),
+  "batch_filter": "all" | "overdue" | "recurring" | null (batch일 때 필터),
   "reply": "한국어 답변"
 }}
 
@@ -155,8 +162,9 @@ def build_system_prompt(now: datetime) -> str:
    반드시 todo_id에 해당 ID.
 
 2. **intent 판단:**
-   - 새 할일 → "new_todo"
-   - 완료: "다했다", "끝", "더 안봐도 돼", "됐어" → "complete_todo"
+   - 새 할일 (1회성) → "new_todo"
+   - **장기/반복 프로젝트**: "매일 리마인더", "장기 프로젝트", "계속 알려줘", "그만할때까지" → "new_recurring"
+   - 완료: "다했다", "끝", "더 안봐도 돼", "됐어", "그만해", "중단해" → "complete_todo"
    - 기한 변경: "늘려줘", "연장", "기한 변경" → "modify_todo"
    - 삭제 단건: "삭제해", "취소해" → "delete_todo"
    - **일괄 처리**: "모두/전부/다 삭제", "기한 초과 전부 삭제", "할일 초기화", "전부 완료" → "batch"
@@ -164,24 +172,30 @@ def build_system_prompt(now: datetime) -> str:
    - 사용법 → "help"
    - 할일 무관 → "off_topic"
 
-3. **batch (일괄 처리):**
+3. **new_recurring (장기/반복 프로젝트):**
+   - tasks: 여러 건 동시 등록 배열. 반드시 메시지에 언급된 모든 항목 포함.
+   - reminder_time: "HH:MM" (24시간 KST). 미지정 시 "19:00".
+   - 예: "매일 7시에 리마인더 해줘 1.A 2.B 3.C" → tasks: [A, B, C], reminder_time: "19:00"
+
+4. **batch (일괄 처리):**
    - "할일 모두 삭제해줘" / "전부 삭제" / "초기화" → batch_action: "delete", batch_filter: "all"
    - "기한 초과된 것 다 삭제" → batch_action: "delete", batch_filter: "overdue"
+   - "반복 프로젝트 전부 삭제" → batch_action: "delete", batch_filter: "recurring"
    - "전부 완료 처리해" → batch_action: "complete", batch_filter: "all"
    - "PNK랑 딜로이트 삭제해" → batch_action: "delete", batch_ids: [해당 id들]
-   - "PNK랑 그린우드 완료" → batch_action: "complete", batch_ids: [해당 id들]
    - batch_filter와 batch_ids 중 하나만 사용. 둘 다 있으면 batch_ids 우선.
    - reply에 처리 결과 미리 작성.
 
-4. **new_todo:** task=핵심만, deadline_iso=절대시각(미지정→23:59), 파악불가→null
+5. **new_todo:** task=핵심만, deadline_iso=절대시각(미지정→23:59), 파악불가→null
 
-5. **complete_todo:** reply_context 있으면 그 ID. 없으면 메시지로 매칭. 1개면 자동.
+6. **complete_todo:** reply_context 있으면 그 ID. 없으면 메시지로 매칭. 1개면 자동.
+   반복 프로젝트에 "그만해", "중단해" → complete_todo로 처리.
 
-6. **modify_todo:** todo_id + deadline_iso 필수. "이번주 토요일" = 이번 주 토요일 23:59.
+7. **modify_todo:** todo_id + deadline_iso 필수. "이번주 토요일" = 이번 주 토요일 23:59.
 
-7. **delete_todo:** todo_id 필수.
+8. **delete_todo:** todo_id 필수.
 
-8. **reply:** 반말/존댓말 맞춤. 간결 3줄. HTML <b><i><code> 가능."""
+9. **reply:** 반말/존댓말 맞춤. 간결 3줄. HTML <b><i><code> 가능."""
 
 
 def build_user_message(text: str, reply_todo: dict | None) -> str:
@@ -426,6 +440,52 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_html("\n".join(lines))
         log.info(f"[NEW] {task} → {deadline_iso}")
 
+    # ── new_recurring ──
+    elif intent == "new_recurring":
+        tasks = result.get("tasks") or []
+        reminder_time = result.get("reminder_time", "19:00")
+        if not tasks:
+            # tasks가 비어있으면 task 필드에서 단건 처리
+            single = result.get("task")
+            if single:
+                tasks = [{"task": single}]
+
+        if not tasks:
+            await msg.reply_html(reply or "🤔 등록할 항목을 알려주세요.")
+        else:
+            created = []
+            for item in tasks:
+                task_name = item.get("task", "")
+                if not task_name:
+                    continue
+                project = detect_project(task_name) or detect_project(text)
+                todo = {
+                    "id": str(uuid.uuid4())[:8],
+                    "type": "recurring",
+                    "task": task_name,
+                    "reminder_time": reminder_time,
+                    "deadline": None,
+                    "project": project,
+                    "status": "active",
+                    "created_at": now.isoformat(),
+                    "last_reminded_at": None,
+                    "last_daily_date": None,
+                    "original_message": text,
+                }
+                STATE["todos"].append(todo)
+                created.append(todo)
+
+            persist()
+
+            lines = [reply] if reply else [f"🔄 <b>{len(created)}건 반복 프로젝트 등록!</b>"]
+            lines.append(f"⏰ 매일 {reminder_time} KST 리마인더\n")
+            for t in created:
+                proj = f" [{t['project']}]" if t.get("project") else ""
+                lines.append(f"  📌 {t['task']}{proj}")
+            lines.append(f"\n<i>중단하려면 리마인더에 답장 → '그만해'</i>")
+            await msg.reply_html("\n".join(lines))
+            log.info(f"[NEW_RECURRING] {len(created)}건 | {reminder_time}")
+
     # ── complete_todo ──
     elif intent == "complete_todo":
         matched = None
@@ -517,6 +577,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             targets = active
         elif batch_filter == "overdue":
             targets = [t for t in active if t.get("deadline") and datetime.fromisoformat(t["deadline"]) < now]
+        elif batch_filter == "recurring":
+            targets = [t for t in active if t.get("type") == "recurring"]
 
         if not targets:
             await msg.reply_html(reply or "🤔 대상 할일을 찾지 못했어요.")
@@ -574,7 +636,32 @@ def get_reminder_interval(deadline_iso: str, now: datetime) -> float | None:
 async def reminder_check(ctx: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(KST)
     for todo in STATE["todos"]:
-        if todo["status"] == "active" and todo.get("deadline"):
+        # ── 반복 프로젝트 리마인더 ──
+        if todo["status"] == "active" and todo.get("type") == "recurring" and todo.get("reminder_time"):
+            r_hour, r_min = map(int, todo["reminder_time"].split(":"))
+            reminder_dt = now.replace(hour=r_hour, minute=r_min, second=0, microsecond=0)
+            # 리마인더 시각이 지났고, 오늘 아직 안 보냈으면 발송
+            if now >= reminder_dt and todo.get("last_daily_date") != now.strftime("%Y-%m-%d"):
+                proj = f"\n📁 {todo['project']}" if todo.get("project") else ""
+                sent = await ctx.bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=(
+                        f"🔄 <b>장기 프로젝트 리마인더</b>\n\n"
+                        f"📌 {todo['task']}{proj}\n"
+                        f"⏰ 매일 {todo['reminder_time']} 반복\n\n"
+                        f"<i>↩️ 이 메시지에 답장으로:\n"
+                        f"완료 → '다했다'  중단 → '그만해'</i>"
+                    ),
+                    parse_mode="HTML",
+                )
+                todo["last_reminded_at"] = now.isoformat()
+                todo["last_daily_date"] = now.strftime("%Y-%m-%d")
+                STATE.setdefault("reminder_msg_map", {})[str(sent.message_id)] = todo["id"]
+                persist()
+                log.info(f"[REMIND_RECURRING] {todo['task']}")
+
+        # ── 1회성 할일 리마인더 ──
+        elif todo["status"] == "active" and todo.get("deadline") and todo.get("type") != "recurring":
             interval = get_reminder_interval(todo["deadline"], now)
             if interval is None:
                 if now.hour < 7 or now.hour > 9: continue
@@ -629,26 +716,39 @@ async def send_summary(bot, now: datetime, force: bool = False):
             await bot.send_message(chat_id=CHAT_ID, text="📭 활성 할일 없음. 한가하시네요! 😎")
         return
 
-    active.sort(key=lambda t: datetime.fromisoformat(t["deadline"]) if t.get("deadline") else datetime.max.replace(tzinfo=KST))
+    one_time = [t for t in active if t.get("type") != "recurring"]
+    recurring = [t for t in active if t.get("type") == "recurring"]
+
+    one_time.sort(key=lambda t: datetime.fromisoformat(t["deadline"]) if t.get("deadline") else datetime.max.replace(tzinfo=KST))
     wday = WEEKDAYS_KR[now.weekday()]
     lines = [f"📋 <b>오늘의 할일 ({now.month}/{now.day} {wday})</b>\n"]
 
-    overdue = [t for t in active if t.get("deadline") and datetime.fromisoformat(t["deadline"]) < now]
-    today_end = now.replace(hour=23, minute=59, second=59)
-    today_due = [t for t in active if t.get("deadline") and now <= datetime.fromisoformat(t["deadline"]) <= today_end and t not in overdue]
-    upcoming = [t for t in active if t not in overdue and t not in today_due]
+    if one_time:
+        overdue = [t for t in one_time if t.get("deadline") and datetime.fromisoformat(t["deadline"]) < now]
+        today_end = now.replace(hour=23, minute=59, second=59)
+        today_due = [t for t in one_time if t.get("deadline") and now <= datetime.fromisoformat(t["deadline"]) <= today_end and t not in overdue]
+        upcoming = [t for t in one_time if t not in overdue and t not in today_due]
 
-    for label, group in [("🔴 기한 초과", overdue), ("🟡 오늘 마감", today_due), ("🟢 예정", upcoming)]:
-        if not group: continue
-        lines.append(f"<b>{label}:</b>")
-        for t in group:
+        for label, group in [("🔴 기한 초과", overdue), ("🟡 오늘 마감", today_due), ("🟢 예정", upcoming)]:
+            if not group: continue
+            lines.append(f"<b>{label}:</b>")
+            for t in group:
+                proj = f" [{t['project']}]" if t.get("project") else ""
+                task = t.get("task", "(미입력)")
+                dl = format_deadline(t["deadline"], now) if t.get("deadline") else "⚠️ 데드라인 미설정"
+                lines.append(f"  • {task}{proj}\n    {dl}")
+            lines.append("")
+
+    if recurring:
+        lines.append(f"<b>🔄 장기 프로젝트 ({len(recurring)}건):</b>")
+        for t in recurring:
             proj = f" [{t['project']}]" if t.get("project") else ""
             task = t.get("task", "(미입력)")
-            dl = format_deadline(t["deadline"], now) if t.get("deadline") else "⚠️ 데드라인 미설정"
-            lines.append(f"  • {task}{proj}\n    {dl}")
+            rt = t.get("reminder_time", "19:00")
+            lines.append(f"  • {task}{proj}\n    매일 {rt} 리마인더")
         lines.append("")
 
-    lines.append(f"총 {len(active)}건 | /list")
+    lines.append(f"총 {len(active)}건 (1회성 {len(one_time)} + 반복 {len(recurring)}) | /list")
     await bot.send_message(chat_id=CHAT_ID, text="\n".join(lines), parse_mode="HTML")
 
 
