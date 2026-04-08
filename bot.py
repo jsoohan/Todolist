@@ -198,7 +198,7 @@ async def _call_gemini(system: str, user_msg: str) -> dict | None:
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}",
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key={GEMINI_KEY}",
                 headers={"content-type": "application/json"},
                 json={
                     "systemInstruction": {"parts": [{"text": system}]},
