@@ -6,6 +6,7 @@
 - python-telegram-bot long polling + Claude Haiku + JobQueue
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -197,36 +198,56 @@ async def ask_llm(text: str, now: datetime, reply_todo: dict | None = None) -> d
     system = build_system_prompt(now)
     user_msg = build_user_message(text, reply_todo)
 
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 500,
-                    "system": system,
-                    "messages": [{"role": "user", "content": user_msg}],
-                },
-            )
-            if resp.status_code != 200:
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": ANTHROPIC_KEY,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": "claude-haiku-4-5-20251001",
+                        "max_tokens": 500,
+                        "system": system,
+                        "messages": [{"role": "user", "content": user_msg}],
+                    },
+                )
+                if resp.status_code == 200:
+                    content = resp.json().get("content", [])
+                    raw = "".join(c.get("text", "") for c in content).strip()
+                    raw = re.sub(r"^```json\s*", "", raw)
+                    raw = re.sub(r"\s*```$", "", raw)
+                    return json.loads(raw)
+
                 log.error(f"LLM API {resp.status_code}: {resp.text[:500]}")
+                # 429(rate limit), 529(overloaded), 5xx → 재시도
+                if resp.status_code in (429, 529) or resp.status_code >= 500:
+                    if attempt < max_retries:
+                        wait = 2 ** (attempt + 1)
+                        log.info(f"LLM 재시도 {attempt+1}/{max_retries} ({wait}초 후)")
+                        await asyncio.sleep(wait)
+                        continue
                 return None
-            content = resp.json().get("content", [])
-            raw = "".join(c.get("text", "") for c in content).strip()
-            raw = re.sub(r"^```json\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            return json.loads(raw)
-    except json.JSONDecodeError as e:
-        log.error(f"LLM JSON 파싱 실패: {e}\nraw: {raw[:300]}")
-        return None
-    except Exception as e:
-        log.error(f"LLM 호출 실패: {e}")
-        return None
+
+        except json.JSONDecodeError as e:
+            log.error(f"LLM JSON 파싱 실패: {e}\nraw: {raw[:300]}")
+            return None
+        except httpx.TimeoutException as e:
+            log.error(f"LLM 타임아웃: {e}")
+            if attempt < max_retries:
+                wait = 2 ** (attempt + 1)
+                log.info(f"LLM 재시도 {attempt+1}/{max_retries} ({wait}초 후)")
+                await asyncio.sleep(wait)
+                continue
+            return None
+        except Exception as e:
+            log.error(f"LLM 호출 실패: {e}")
+            return None
+    return None
 
 
 # ══════════════════════════════════════════════════════════
@@ -321,7 +342,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── LLM 분석 ──
     result = await ask_llm(text, now, reply_todo=reply_todo)
     if not result:
-        await msg.reply_html("🤖 잠시 문제가 생겼어요. 다시 말씀해주세요.")
+        if not ANTHROPIC_KEY:
+            await msg.reply_html("🤖 API 키가 설정되지 않았어요. <code>ANTHROPIC_API_KEY</code> 환경변수를 확인해주세요.")
+        else:
+            await msg.reply_html("🤖 AI 응답을 받지 못했어요. 잠시 후 다시 시도해주세요.\n<i>(서버 로그에서 원인을 확인해주세요)</i>")
         return
 
     intent = result.get("intent", "off_topic")
