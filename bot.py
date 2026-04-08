@@ -6,6 +6,7 @@
 - python-telegram-bot long polling + Claude Haiku + JobQueue
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -35,6 +36,7 @@ log = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 KST = timezone(timedelta(hours=9))
 WEEKDAYS_KR = ["월", "화", "수", "목", "금", "토", "일"]
 
@@ -189,16 +191,45 @@ def build_user_message(text: str, reply_todo: dict | None) -> str:
     return text
 
 
-async def ask_llm(text: str, now: datetime, reply_todo: dict | None = None) -> dict | None:
-    if not ANTHROPIC_KEY:
-        log.warning("ANTHROPIC_API_KEY 없음")
+async def _call_gemini(system: str, user_msg: str) -> dict | None:
+    """Gemini Flash API 호출."""
+    if not GEMINI_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}",
+                headers={"content-type": "application/json"},
+                json={
+                    "systemInstruction": {"parts": [{"text": system}]},
+                    "contents": [{"parts": [{"text": user_msg}]}],
+                    "generationConfig": {
+                        "maxOutputTokens": 500,
+                        "responseMimeType": "application/json",
+                    },
+                },
+            )
+            if resp.status_code != 200:
+                log.error(f"Gemini API {resp.status_code}: {resp.text[:500]}")
+                return None
+            raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            raw = re.sub(r"^```json\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+            return json.loads(raw)
+    except json.JSONDecodeError as e:
+        log.error(f"Gemini JSON 파싱 실패: {e}\nraw: {raw[:300]}")
+        return None
+    except Exception as e:
+        log.error(f"Gemini 호출 실패: {e}")
         return None
 
-    system = build_system_prompt(now)
-    user_msg = build_user_message(text, reply_todo)
 
+async def _call_claude(system: str, user_msg: str) -> dict | None:
+    """Claude API 호출."""
+    if not ANTHROPIC_KEY:
+        return None
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={
@@ -214,7 +245,7 @@ async def ask_llm(text: str, now: datetime, reply_todo: dict | None = None) -> d
                 },
             )
             if resp.status_code != 200:
-                log.error(f"LLM API {resp.status_code}: {resp.text[:500]}")
+                log.error(f"Claude API {resp.status_code}: {resp.text[:500]}")
                 return None
             content = resp.json().get("content", [])
             raw = "".join(c.get("text", "") for c in content).strip()
@@ -222,11 +253,37 @@ async def ask_llm(text: str, now: datetime, reply_todo: dict | None = None) -> d
             raw = re.sub(r"\s*```$", "", raw)
             return json.loads(raw)
     except json.JSONDecodeError as e:
-        log.error(f"LLM JSON 파싱 실패: {e}\nraw: {raw[:300]}")
+        log.error(f"Claude JSON 파싱 실패: {e}\nraw: {raw[:300]}")
         return None
     except Exception as e:
-        log.error(f"LLM 호출 실패: {e}")
+        log.error(f"Claude 호출 실패: {e}")
         return None
+
+
+async def ask_llm(text: str, now: datetime, reply_todo: dict | None = None) -> dict | None:
+    if not GEMINI_KEY and not ANTHROPIC_KEY:
+        log.warning("API 키 없음 (GEMINI_API_KEY, ANTHROPIC_API_KEY 둘 다 미설정)")
+        return None
+
+    system = build_system_prompt(now)
+    user_msg = build_user_message(text, reply_todo)
+
+    # 1차: Gemini Flash (무료)
+    if GEMINI_KEY:
+        result = await _call_gemini(system, user_msg)
+        if result:
+            log.info("[LLM] Gemini Flash 응답 성공")
+            return result
+        log.warning("[LLM] Gemini 실패 → Claude 폴백 시도")
+
+    # 2차: Claude (유료 폴백)
+    if ANTHROPIC_KEY:
+        result = await _call_claude(system, user_msg)
+        if result:
+            log.info("[LLM] Claude 폴백 응답 성공")
+            return result
+
+    return None
 
 
 # ══════════════════════════════════════════════════════════
@@ -321,7 +378,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── LLM 분석 ──
     result = await ask_llm(text, now, reply_todo=reply_todo)
     if not result:
-        await msg.reply_html("🤖 잠시 문제가 생겼어요. 다시 말씀해주세요.")
+        if not GEMINI_KEY and not ANTHROPIC_KEY:
+            await msg.reply_html("🤖 API 키가 설정되지 않았어요. <code>GEMINI_API_KEY</code> 또는 <code>ANTHROPIC_API_KEY</code> 환경변수를 확인해주세요.")
+        else:
+            await msg.reply_html("🤖 AI 응답을 받지 못했어요. 잠시 후 다시 시도해주세요.\n<i>(서버 로그에서 원인을 확인해주세요)</i>")
         return
 
     intent = result.get("intent", "off_topic")
@@ -611,7 +671,10 @@ async def cleanup_job(ctx: ContextTypes.DEFAULT_TYPE):
 
 def main():
     log.info("=== 할일봇 v2 시작 ===")
-    log.info(f"CHAT_ID: {CHAT_ID} | LLM: {'활성' if ANTHROPIC_KEY else '비활성'}")
+    llm_status = []
+    if GEMINI_KEY: llm_status.append("Gemini(주)")
+    if ANTHROPIC_KEY: llm_status.append("Claude(폴백)")
+    log.info(f"CHAT_ID: {CHAT_ID} | LLM: {', '.join(llm_status) or '비활성'}")
     log.info(f"활성 할일: {len([t for t in STATE['todos'] if t['status'] == 'active'])}건")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
