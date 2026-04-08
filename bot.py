@@ -642,42 +642,73 @@ def get_reminder_interval(deadline_iso: str, now: datetime) -> float | None:
 
 async def reminder_check(ctx: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(KST)
-    for todo in STATE["todos"]:
-        # ── 반복 프로젝트 리마인더 ──
-        if todo["status"] == "active" and todo.get("type") == "recurring" and todo.get("reminder_time"):
-            r_hour, r_min = map(int, todo["reminder_time"].split(":"))
-            reminder_dt = now.replace(hour=r_hour, minute=r_min, second=0, microsecond=0)
-            # 리마인더 시각이 지났고, 오늘 아직 안 보냈으면 발송
-            if now >= reminder_dt and todo.get("last_daily_date") != now.strftime("%Y-%m-%d"):
-                proj = f"\n📁 {todo['project']}" if todo.get("project") else ""
-                sent = await ctx.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=(
-                        f"🔄 <b>장기 프로젝트 리마인더</b>\n\n"
-                        f"📌 {todo['task']}{proj}\n"
-                        f"⏰ 매일 {todo['reminder_time']} 반복\n\n"
-                        f"<i>↩️ 이 메시지에 답장으로:\n"
-                        f"완료 → '다했다'  중단 → '그만해'</i>"
-                    ),
-                    parse_mode="HTML",
-                )
-                todo["last_reminded_at"] = now.isoformat()
-                todo["last_daily_date"] = now.strftime("%Y-%m-%d")
-                STATE.setdefault("reminder_msg_map", {})[str(sent.message_id)] = todo["id"]
-                persist()
-                log.info(f"[REMIND_RECURRING] {todo['task']}")
+    today = now.strftime("%Y-%m-%d")
 
-        # ── 1회성 할일 리마인더 ──
+    # ── 1단계: 보낼 리마인더 수집 ──
+    recurring_due = []
+    deadline_due = []
+    pending_due = []
+
+    for todo in STATE["todos"]:
+        # 반복 프로젝트
+        if todo["status"] == "active" and todo.get("type") == "recurring" and todo.get("reminder_time"):
+            try:
+                r_hour, r_min = map(int, todo["reminder_time"].split(":"))
+                reminder_dt = now.replace(hour=r_hour, minute=r_min, second=0, microsecond=0)
+                if now >= reminder_dt and todo.get("last_daily_date") != today:
+                    recurring_due.append(todo)
+            except (ValueError, AttributeError):
+                continue
+
+        # 1회성 데드라인
         elif todo["status"] == "active" and todo.get("deadline") and todo.get("type") != "recurring":
             interval = get_reminder_interval(todo["deadline"], now)
             if interval is None:
-                if now.hour < 7 or now.hour > 9: continue
-                if todo.get("last_daily_date") == now.strftime("%Y-%m-%d"): continue
+                if now.hour < 7 or now.hour > 9:
+                    continue
+                if todo.get("last_daily_date") == today:
+                    continue
             else:
                 if todo.get("last_reminded_at"):
                     elapsed = (now - datetime.fromisoformat(todo["last_reminded_at"])).total_seconds() / 3600
-                    if elapsed < interval - 0.1: continue
+                    if elapsed < interval - 0.1:
+                        continue
+            deadline_due.append(todo)
 
+        # 미완성 입력
+        elif todo["status"] == "pending_input":
+            if 10 < now.minute < 50:
+                continue
+            if todo.get("last_reminded_at"):
+                if (now - datetime.fromisoformat(todo["last_reminded_at"])).total_seconds() < 3000:
+                    continue
+            pending_due.append(todo)
+
+    # ── 2단계: 통합 발송 ──
+
+    # 반복 프로젝트 → 1개 메시지로 통합
+    if recurring_due:
+        lines = ["🔄 <b>장기 프로젝트 리마인더</b>\n"]
+        for i, todo in enumerate(recurring_due, 1):
+            proj = f"  <i>{todo['project']}</i>" if todo.get("project") else ""
+            lines.append(f"  {i}. {todo['task']}{proj}")
+        rt = recurring_due[0].get("reminder_time", "19:00")
+        lines.append(f"\n⏰ 매일 {rt} 반복 · {len(recurring_due)}건")
+        lines.append(f"\n<i>↩️ 답장: '1번 다했다' / '헬스케어 그만해'</i>")
+
+        sent = await ctx.bot.send_message(
+            chat_id=CHAT_ID, text="\n".join(lines), parse_mode="HTML",
+        )
+        for todo in recurring_due:
+            todo["last_reminded_at"] = now.isoformat()
+            todo["last_daily_date"] = today
+        persist()
+        log.info(f"[REMIND_RECURRING] {len(recurring_due)}건 통합 발송")
+
+    # 데드라인 할일 → 1건이면 개별, 2건 이상이면 통합
+    if deadline_due:
+        if len(deadline_due) == 1:
+            todo = deadline_due[0]
             dl_str = format_deadline(todo["deadline"], now)
             proj = f"\n📁 {todo['project']}" if todo.get("project") else ""
             sent = await ctx.bot.send_message(
@@ -686,30 +717,45 @@ async def reminder_check(ctx: ContextTypes.DEFAULT_TYPE):
                     f"⏰ <b>리마인더</b>\n\n"
                     f"📌 {todo['task']}\n"
                     f"⏳ {dl_str}{proj}\n\n"
-                    f"<i>↩️ 이 메시지에 답장으로:\n"
-                    f"완료 → '다했다'  기한변경 → '금요일까지'</i>"
+                    f"<i>↩️ 답장: '다했다' / '금요일까지'</i>"
                 ),
                 parse_mode="HTML",
             )
             todo["last_reminded_at"] = now.isoformat()
-            todo["last_daily_date"] = now.strftime("%Y-%m-%d")
+            todo["last_daily_date"] = today
             STATE.setdefault("reminder_msg_map", {})[str(sent.message_id)] = todo["id"]
             persist()
             log.info(f"[REMIND] {todo['task']}")
+        else:
+            # 다건 통합
+            deadline_due.sort(key=lambda t: datetime.fromisoformat(t["deadline"]))
+            lines = [f"⏰ <b>리마인더</b> ({len(deadline_due)}건)\n"]
+            for todo in deadline_due:
+                dl_str = format_deadline(todo["deadline"], now)
+                proj = f" [{todo['project']}]" if todo.get("project") else ""
+                lines.append(f"  📌 {todo['task']}{proj}\n    {dl_str}")
+            lines.append(f"\n<i>↩️ 답장: '증권거래세 다했다' / '코엑스 금요일까지'</i>")
 
-        elif todo["status"] == "pending_input":
-            if 10 < now.minute < 50: continue
-            if todo.get("last_reminded_at"):
-                if (now - datetime.fromisoformat(todo["last_reminded_at"])).total_seconds() < 3000: continue
-            missing = []
-            if not todo.get("task"): missing.append("할일 내용")
-            if not todo.get("deadline"): missing.append("데드라인")
-            await ctx.bot.send_message(
-                chat_id=CHAT_ID, parse_mode="HTML",
-                text=f"⚠️ <b>입력 미완성</b>\n원본: <code>{todo.get('original_message', '?')}</code>\n부족: {', '.join(missing)}",
+            sent = await ctx.bot.send_message(
+                chat_id=CHAT_ID, text="\n".join(lines), parse_mode="HTML",
             )
-            todo["last_reminded_at"] = now.isoformat()
+            for todo in deadline_due:
+                todo["last_reminded_at"] = now.isoformat()
+                todo["last_daily_date"] = today
             persist()
+            log.info(f"[REMIND] {len(deadline_due)}건 통합 발송")
+
+    # 미완성 입력
+    for todo in pending_due:
+        missing = []
+        if not todo.get("task"): missing.append("할일 내용")
+        if not todo.get("deadline"): missing.append("데드라인")
+        await ctx.bot.send_message(
+            chat_id=CHAT_ID, parse_mode="HTML",
+            text=f"⚠️ <b>입력 미완성</b>\n원본: <code>{todo.get('original_message', '?')}</code>\n부족: {', '.join(missing)}",
+        )
+        todo["last_reminded_at"] = now.isoformat()
+        persist()
 
 
 async def daily_summary(ctx: ContextTypes.DEFAULT_TYPE):
