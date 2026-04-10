@@ -648,6 +648,11 @@ def get_reminder_interval(deadline_iso: str, now: datetime) -> float | None:
 
 async def reminder_check(ctx: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(KST)
+
+    # ── 야간 무음 (0시~6시 KST) ──
+    if now.hour < 6:
+        return
+
     today = now.strftime("%Y-%m-%d")
 
     # ── 1단계: 보낼 리마인더 수집 ──
