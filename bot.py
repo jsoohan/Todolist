@@ -186,7 +186,12 @@ def build_system_prompt(now: datetime) -> str:
    - batch_filter와 batch_ids 중 하나만 사용. 둘 다 있으면 batch_ids 우선.
    - reply에 처리 결과 미리 작성.
 
-5. **new_todo:** task=핵심만, deadline_iso=절대시각(미지정→23:59), 파악불가→null
+5. **new_todo:** task=핵심만, deadline_iso=절대시각, 파악불가→null
+   시간 추론 규칙:
+   - 시간 명시 없이 날짜만 → 23:59
+   - "점심" → 12:00, "아침" → 09:00, "저녁" → 18:00, "오전" → 11:00, "오후" → 17:00
+   - "퇴근 전" → 18:00, "업무시간" → 09:00~18:00
+   - "점심 잡자/약속" 등 식사 맥락 → 12:00
 
 6. **complete_todo:** reply_context 있으면 그 ID. 없으면 메시지로 매칭. 1개면 자동.
    반복 프로젝트에 "그만해", "중단해" → complete_todo로 처리.
