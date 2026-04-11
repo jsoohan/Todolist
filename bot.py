@@ -37,6 +37,10 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
 KST = timezone(timedelta(hours=9))
 WEEKDAYS_KR = ["월", "화", "수", "목", "금", "토", "일"]
 
@@ -314,6 +318,113 @@ async def ask_llm(text: str, now: datetime, reply_todo: dict | None = None) -> d
 
 
 # ══════════════════════════════════════════════════════════
+#  Google Calendar 연동
+# ══════════════════════════════════════════════════════════
+
+def gcal_enabled() -> bool:
+    return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN)
+
+
+async def _gcal_token() -> str | None:
+    """Refresh token으로 access token 획득."""
+    if not gcal_enabled():
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id": GOOGLE_CLIENT_ID,
+                    "client_secret": GOOGLE_CLIENT_SECRET,
+                    "refresh_token": GOOGLE_REFRESH_TOKEN,
+                    "grant_type": "refresh_token",
+                },
+            )
+            if resp.status_code == 200:
+                return resp.json()["access_token"]
+            log.error(f"[GCAL] 토큰 갱신 실패: {resp.status_code}")
+    except Exception as e:
+        log.error(f"[GCAL] 토큰 갱신 오류: {e}")
+    return None
+
+
+async def gcal_create(task: str, deadline_iso: str, project: str | None = None) -> str | None:
+    """캘린더 이벤트 생성 → event_id 반환."""
+    token = await _gcal_token()
+    if not token:
+        return None
+    try:
+        dl = datetime.fromisoformat(deadline_iso)
+        event = {
+            "summary": task,
+            "start": {"dateTime": deadline_iso, "timeZone": "Asia/Seoul"},
+            "end": {"dateTime": (dl + timedelta(minutes=30)).isoformat(), "timeZone": "Asia/Seoul"},
+            "reminders": {"useDefault": False},
+        }
+        if project:
+            event["description"] = f"📁 {project}"
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"https://www.googleapis.com/calendar/v3/calendars/{GOOGLE_CALENDAR_ID}/events",
+                headers={"Authorization": f"Bearer {token}"},
+                json=event,
+            )
+            if resp.status_code == 200:
+                eid = resp.json()["id"]
+                log.info(f"[GCAL] 생성: {task} → {eid}")
+                return eid
+            log.error(f"[GCAL] 생성 실패: {resp.status_code}: {resp.text[:300]}")
+    except Exception as e:
+        log.error(f"[GCAL] 생성 오류: {e}")
+    return None
+
+
+async def gcal_delete(event_id: str) -> bool:
+    """캘린더 이벤트 삭제."""
+    token = await _gcal_token()
+    if not token or not event_id:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.delete(
+                f"https://www.googleapis.com/calendar/v3/calendars/{GOOGLE_CALENDAR_ID}/events/{event_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if resp.status_code in (200, 204):
+                log.info(f"[GCAL] 삭제: {event_id}")
+                return True
+            log.error(f"[GCAL] 삭제 실패: {resp.status_code}")
+    except Exception as e:
+        log.error(f"[GCAL] 삭제 오류: {e}")
+    return False
+
+
+async def gcal_update(event_id: str, deadline_iso: str) -> bool:
+    """캘린더 이벤트 시간 수정."""
+    token = await _gcal_token()
+    if not token or not event_id:
+        return False
+    try:
+        dl = datetime.fromisoformat(deadline_iso)
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.patch(
+                f"https://www.googleapis.com/calendar/v3/calendars/{GOOGLE_CALENDAR_ID}/events/{event_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "start": {"dateTime": deadline_iso, "timeZone": "Asia/Seoul"},
+                    "end": {"dateTime": (dl + timedelta(minutes=30)).isoformat(), "timeZone": "Asia/Seoul"},
+                },
+            )
+            if resp.status_code == 200:
+                log.info(f"[GCAL] 수정: {event_id}")
+                return True
+            log.error(f"[GCAL] 수정 실패: {resp.status_code}")
+    except Exception as e:
+        log.error(f"[GCAL] 수정 오류: {e}")
+    return False
+
+
+# ══════════════════════════════════════════════════════════
 #  유틸
 # ══════════════════════════════════════════════════════════
 
@@ -435,6 +546,12 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "last_daily_date": None,
             "original_message": text,
         }
+        # 캘린더 연동
+        if has_all and gcal_enabled():
+            eid = await gcal_create(task, deadline_iso, project)
+            if eid:
+                todo["gcal_event_id"] = eid
+
         STATE["todos"].append(todo)
         persist()
 
@@ -445,6 +562,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             lines.append(f"⏰ {format_deadline(deadline_iso, now)}")
         if project:
             lines.append(f"📁 {project}")
+        if todo.get("gcal_event_id"):
+            lines.append("📅 구글 캘린더에 추가됨")
         if not has_all:
             missing = []
             if not task: missing.append("할일 내용")
@@ -513,6 +632,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if matched:
             matched["status"] = "done"
             matched["done_at"] = now.isoformat()
+            if matched.get("gcal_event_id"):
+                await gcal_delete(matched["gcal_event_id"])
             persist()
             await msg.reply_html(reply or f"✅ <b>{matched.get('task', '할일')}</b> 완료!")
             log.info(f"[DONE] {matched.get('task')}")
@@ -540,6 +661,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             matched["deadline_display"] = result.get("deadline_raw")
             matched["last_reminded_at"] = None
             matched["last_daily_date"] = None
+            if matched.get("gcal_event_id"):
+                await gcal_update(matched["gcal_event_id"], new_deadline)
             persist()
             dl_str = format_deadline(new_deadline, now)
             await msg.reply_html(reply or f"📅 <b>{matched.get('task')}</b> 기한 변경!\n⏰ {dl_str}")
@@ -564,6 +687,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if matched:
             matched["status"] = "deleted"
             matched["done_at"] = now.isoformat()
+            if matched.get("gcal_event_id"):
+                await gcal_delete(matched["gcal_event_id"])
             persist()
             await msg.reply_html(reply or f"🗑️ <b>{matched.get('task')}</b> 삭제!")
             log.info(f"[DELETE] {matched.get('task')}")
@@ -601,9 +726,13 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if batch_action == "delete":
                     t["status"] = "deleted"
                     t["done_at"] = now.isoformat()
+                    if t.get("gcal_event_id"):
+                        await gcal_delete(t["gcal_event_id"])
                 elif batch_action == "complete":
                     t["status"] = "done"
                     t["done_at"] = now.isoformat()
+                    if t.get("gcal_event_id"):
+                        await gcal_delete(t["gcal_event_id"])
                 elif batch_action == "modify" and new_deadline:
                     t["deadline"] = new_deadline
                     t["deadline_display"] = result.get("deadline_raw")
@@ -838,7 +967,7 @@ def main():
     llm_status = []
     if GEMINI_KEY: llm_status.append("Gemini(주)")
     if ANTHROPIC_KEY: llm_status.append("Claude(폴백)")
-    log.info(f"CHAT_ID: {CHAT_ID} | LLM: {', '.join(llm_status) or '비활성'}")
+    log.info(f"CHAT_ID: {CHAT_ID} | LLM: {', '.join(llm_status) or '비활성'} | GCal: {'활성' if gcal_enabled() else '비활성'}")
     log.info(f"활성 할일: {len([t for t in STATE['todos'] if t['status'] == 'active'])}건")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
