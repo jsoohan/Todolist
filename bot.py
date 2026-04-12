@@ -165,9 +165,10 @@ def build_system_prompt(now: datetime) -> str:
 반드시 아래 JSON만 출력. JSON 외 텍스트 절대 금지.
 
 {{
-  "intent": "new_todo" | "new_recurring" | "complete_todo" | "modify_todo" | "delete_todo" | "batch" | "list_todos" | "help" | "off_topic",
+  "intent": "new_todo" | "new_recurring" | "bulk_create" | "complete_todo" | "modify_todo" | "delete_todo" | "batch" | "list_todos" | "help" | "off_topic",
   "task": "할일 내용 (new_todo)",
   "tasks": [{{"task": "할일1"}}, {{"task": "할일2"}}],
+  "items": [{{"type": "one_time|recurring", "task": "...", "deadline_iso": "...", "reminder_time": "HH:MM", "project": "..."}}],
   "reminder_time": "HH:MM (KST, new_recurring)",
   "deadline_raw": "데드라인 원문 (new_todo, modify_todo)",
   "deadline_iso": "YYYY-MM-DDTHH:MM:SS+09:00 또는 null",
@@ -189,6 +190,8 @@ def build_system_prompt(now: datetime) -> str:
 2. **intent 판단:**
    - 새 할일 (1회성) → "new_todo"
    - **장기/반복 프로젝트**: "매일 리마인더", "장기 프로젝트", "계속 알려줘", "그만할때까지" → "new_recurring"
+   - **대량 복원/등록**: 포맷된 목록이나 여러 서로 다른 종류의 할일(1회성+반복 섞임)을 한 번에 등록 → "bulk_create"
+     예: "아래 것 다 되살려줘", "이것들 전부 등록", "리스트 복원" + 목록 붙여넣기
    - 완료 단건: "다했다", "끝", "됐어", "그만해", "중단해" → "complete_todo"
    - **완료 암시 표현도 complete_todo**: "~했어", "~했음", "~완료", "~보냈어", "~얘기했어", "~확인했어", "~처리했어", "~끝났어" → 해당 할일 complete_todo
    - **복수 완료**: "둘다/셋다/다 했어" → "batch" (batch_action: "complete", batch_ids: [해당 ID들])
@@ -210,6 +213,14 @@ def build_system_prompt(now: datetime) -> str:
    - tasks: 여러 건 동시 등록 배열. 반드시 메시지에 언급된 모든 항목 포함.
    - reminder_time: "HH:MM" (24시간 KST). 미지정 시 "19:00".
    - 예: "매일 7시에 리마인더 해줘 1.A 2.B 3.C" → tasks: [A, B, C], reminder_time: "19:00"
+
+3-1. **bulk_create (대량 복원/등록):**
+   - items 배열에 각 할일을 개별 객체로 분리. 반드시 메시지의 모든 항목 포함.
+   - 각 item: {{"type": "one_time" 또는 "recurring", "task": "이름", "deadline_iso": "...", "reminder_time": "HH:MM", "project": "태그"}}
+   - one_time일 때는 deadline_iso 필수, recurring일 때는 reminder_time 필수.
+   - 목록에 "🟢 예정", "🟡", "🔴" 등 마커가 있으면 → type: "one_time", 마커 옆 날짜를 deadline으로.
+   - 목록에 "🔄 장기 프로젝트", "매일 HH:MM 리마인더" 등이 있으면 → type: "recurring", 그 시각을 reminder_time으로.
+   - "[🏥 팽팽클리닉]" 같은 대괄호 태그 → project 필드에 그대로.
 
 4. **batch (일괄 처리):**
    - "할일 모두 삭제해줘" / "전부 삭제" / "초기화" → batch_action: "delete", batch_filter: "all"
@@ -668,6 +679,80 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             lines.append(f"\n<i>중단하려면 리마인더에 답장 → '그만해'</i>")
             await msg.reply_html("\n".join(lines))
             log.info(f"[NEW_RECURRING] {len(created)}건 | {reminder_time}")
+
+    # ── bulk_create (대량 복원/등록) ──
+    elif intent == "bulk_create":
+        items = result.get("items") or []
+        if not items:
+            await msg.reply_html(reply or "🤔 등록할 항목을 알려주세요.")
+        else:
+            created_one = []
+            created_rec = []
+            for item in items:
+                task_name = item.get("task", "").strip()
+                if not task_name:
+                    continue
+                item_type = item.get("type", "one_time")
+                project = item.get("project") or detect_project(task_name)
+
+                if item_type == "recurring":
+                    todo = {
+                        "id": str(uuid.uuid4())[:8],
+                        "type": "recurring",
+                        "task": task_name,
+                        "reminder_time": item.get("reminder_time") or "19:00",
+                        "deadline": None,
+                        "project": project,
+                        "status": "active",
+                        "created_at": now.isoformat(),
+                        "last_reminded_at": None,
+                        "last_daily_date": None,
+                        "original_message": text[:200],
+                    }
+                    STATE["todos"].append(todo)
+                    created_rec.append(todo)
+                else:
+                    deadline_iso = item.get("deadline_iso")
+                    if not deadline_iso:
+                        continue
+                    todo = {
+                        "id": str(uuid.uuid4())[:8],
+                        "task": task_name,
+                        "deadline": deadline_iso,
+                        "project": project,
+                        "status": "active",
+                        "created_at": now.isoformat(),
+                        "last_reminded_at": None,
+                        "last_daily_date": None,
+                        "original_message": text[:200],
+                    }
+                    # 캘린더 연동
+                    if gcal_enabled():
+                        cal_key = item.get("calendar")
+                        eid, used_cal = await gcal_create(task_name, deadline_iso, project, cal_key)
+                        if eid:
+                            todo["gcal_event_id"] = eid
+                            todo["gcal_cal_key"] = used_cal
+                    STATE["todos"].append(todo)
+                    created_one.append(todo)
+
+            persist()
+
+            total = len(created_one) + len(created_rec)
+            lines = [reply] if reply else [f"✅ <b>{total}건 등록 완료</b>"]
+            if created_one:
+                lines.append(f"\n📌 1회성 ({len(created_one)}건):")
+                for t in created_one:
+                    dl = format_deadline(t["deadline"], now) if t.get("deadline") else ""
+                    proj = f" [{t['project']}]" if t.get("project") else ""
+                    lines.append(f"  • {t['task']}{proj}\n    {dl}")
+            if created_rec:
+                lines.append(f"\n🔄 반복 ({len(created_rec)}건):")
+                for t in created_rec:
+                    proj = f" [{t['project']}]" if t.get("project") else ""
+                    lines.append(f"  • {t['task']}{proj} (매일 {t['reminder_time']})")
+            await msg.reply_html("\n".join(lines))
+            log.info(f"[BULK_CREATE] 1회성 {len(created_one)}건 + 반복 {len(created_rec)}건")
 
     # ── complete_todo ──
     elif intent == "complete_todo":
