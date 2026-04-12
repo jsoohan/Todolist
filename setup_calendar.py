@@ -65,7 +65,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 server = HTTPServer(("localhost", 8090), Handler)
-server.handle_request()
+# 브라우저가 favicon 등 추가 요청을 보낼 수 있으므로 여러 번 시도
+for _ in range(5):
+    server.handle_request()
+    if code:
+        break
 
 if not code:
     print("❌ 인증 코드를 받지 못했습니다.")

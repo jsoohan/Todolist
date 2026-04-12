@@ -189,13 +189,17 @@ def build_system_prompt(now: datetime) -> str:
 2. **intent 판단:**
    - 새 할일 (1회성) → "new_todo"
    - **장기/반복 프로젝트**: "매일 리마인더", "장기 프로젝트", "계속 알려줘", "그만할때까지" → "new_recurring"
-   - 완료: "다했다", "끝", "더 안봐도 돼", "됐어", "그만해", "중단해" → "complete_todo"
+   - 완료 단건: "다했다", "끝", "됐어", "그만해", "중단해" → "complete_todo"
+   - **완료 암시 표현도 complete_todo**: "~했어", "~했음", "~완료", "~보냈어", "~얘기했어", "~확인했어", "~처리했어", "~끝났어" → 해당 할일 complete_todo
+   - **여러 건 동시 완료**: "둘다 했어", "다 완료", "전부 끝" → "batch" (batch_action: "complete")
    - 기한 변경: "늘려줘", "연장", "기한 변경" → "modify_todo"
    - 삭제 단건: "삭제해", "취소해" → "delete_todo"
    - **일괄 처리**: "모두/전부/다 삭제", "기한 초과 전부 삭제", "할일 초기화", "전부 완료" → "batch"
    - 목록 → "list_todos"
    - 사용법 → "help"
    - 할일 무관 → "off_topic"
+   ⚠️ 사용자가 할일과 관련된 행동을 했다는 말을 하면 절대 off_topic으로 판단하지 말 것.
+   "~한테 얘기했어", "~에 보냈어" 등은 해당 할일 완료 의미.
 
 3. **new_recurring (장기/반복 프로젝트):**
    - tasks: 여러 건 동시 등록 배열. 반드시 메시지에 언급된 모든 항목 포함.
@@ -222,8 +226,10 @@ def build_system_prompt(now: datetime) -> str:
    - 업무/프로젝트/회사 관련 (미팅, 보고서, 프로젝트명 포함 등) → "work"
    - 판단 어려우면 → "work"
 
-6. **complete_todo:** reply_context 있으면 그 ID. 없으면 메시지로 매칭. 1개면 자동.
+6. **complete_todo:** reply_context 있으면 그 ID. 없으면 메시지에서 키워드로 활성 할일 매칭. todo_id 필수.
    반복 프로젝트에 "그만해", "중단해" → complete_todo로 처리.
+   "한동규상무한테 확인했어" → 한동규 관련 할일의 ID를 todo_id에 반드시 포함.
+   "더파운더즈에 얘기했어" → 더파운더즈 관련 할일의 ID를 todo_id에 반드시 포함.
 
 7. **modify_todo:** todo_id + deadline_iso 필수. "이번주 토요일" = 이번 주 토요일 23:59.
 
