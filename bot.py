@@ -191,7 +191,9 @@ def build_system_prompt(now: datetime) -> str:
    - **장기/반복 프로젝트**: "매일 리마인더", "장기 프로젝트", "계속 알려줘", "그만할때까지" → "new_recurring"
    - 완료 단건: "다했다", "끝", "됐어", "그만해", "중단해" → "complete_todo"
    - **완료 암시 표현도 complete_todo**: "~했어", "~했음", "~완료", "~보냈어", "~얘기했어", "~확인했어", "~처리했어", "~끝났어" → 해당 할일 complete_todo
-   - **여러 건 동시 완료**: "둘다 했어", "다 완료", "전부 끝" → "batch" (batch_action: "complete")
+   - **여러 건 동시 완료**: "둘다 했어", "둘다 완료" → "batch" (batch_action: "complete", batch_ids: [직전 대화/리마인더의 해당 2건 ID])
+     ⚠️ "둘다" ≠ "모두". "둘다"는 직전에 언급된 2건만. 절대 전체를 의미하지 않음.
+     ⚠️ batch_filter: "all"은 "전부/모두/싹다 삭제/초기화" 같은 명시적 전체 요청에만 사용.
    - 기한 변경: "늘려줘", "연장", "기한 변경" → "modify_todo"
    - 삭제 단건: "삭제해", "취소해" → "delete_todo"
    - **일괄 처리**: "모두/전부/다 삭제", "기한 초과 전부 삭제", "할일 초기화", "전부 완료" → "batch"
@@ -758,7 +760,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if t:
                     targets.append(t)
         elif batch_filter == "all":
-            targets = active
+            # 완료 처리 시 반복 프로젝트는 제외 (반복은 batch_filter: "recurring"으로 별도 처리)
+            if batch_action == "complete":
+                targets = [t for t in active if t.get("type") != "recurring"]
+            else:
+                targets = active
         elif batch_filter == "overdue":
             targets = [t for t in active if t.get("deadline") and datetime.fromisoformat(t["deadline"]) < now]
         elif batch_filter == "recurring":
