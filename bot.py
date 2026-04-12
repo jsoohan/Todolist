@@ -172,6 +172,7 @@ def build_system_prompt(now: datetime) -> str:
   "reminder_time": "HH:MM (KST, new_recurring)",
   "deadline_raw": "데드라인 원문 (new_todo, modify_todo)",
   "deadline_iso": "YYYY-MM-DDTHH:MM:SS+09:00 또는 null",
+  "add_to_calendar": true | false,
   "calendar": "personal" | "work" | null,
   "todo_id": "대상 #id 또는 null (단건 처리)",
   "batch_action": "complete" | "delete" | "modify" (batch일 때),
@@ -237,10 +238,15 @@ def build_system_prompt(now: datetime) -> str:
    - "점심" → 12:00, "아침" → 09:00, "저녁" → 18:00, "오전" → 11:00, "오후" → 17:00
    - "퇴근 전" → 18:00, "업무시간" → 09:00~18:00
    - "점심 잡자/약속" 등 식사 맥락 → 12:00
-   캘린더 분배 (calendar 필드):
-   - 개인 일정 (점심 약속, 개인 용무, 병원, 가족 등) → "personal"
-   - 업무/프로젝트/회사 관련 (미팅, 보고서, 프로젝트명 포함 등) → "work"
-   - 판단 어려우면 → "work"
+   캘린더 등록 규칙 (매우 중요):
+   - **add_to_calendar는 기본 false.** 사용자가 명시적으로 요청했을 때만 true.
+   - 명시적 요청 예: "캘박", "캘린더에 넣어줘", "캘박해줘", "캘박 부탁", "일정 등록", "캘린더에 추가"
+   - 단순히 "미팅 등록해줘" / "회의 예약" 같은 건 false (할일만 등록, 캘린더 X)
+   - calendar 필드 (add_to_calendar가 true일 때만 의미 있음):
+     - 개인 일정 (점심 약속, 개인 용무, 병원, 가족 등) → "personal"
+     - 업무/프로젝트/회사 관련 (미팅, 보고서, 프로젝트명 포함 등) → "work"
+     - "개캘/개인캘" → "personal", "회캘/회사캘/그린우드캘" → "work"
+     - 판단 어려우면 → "work"
 
 6. **complete_todo:** reply_context 있으면 그 ID. 없으면 메시지에서 키워드로 활성 할일 매칭. todo_id 필수.
    반복 프로젝트에 "그만해", "중단해" → complete_todo로 처리.
@@ -605,9 +611,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "last_daily_date": None,
             "original_message": text,
         }
-        # 캘린더 연동
+        # 캘린더 연동 (명시적 요청 시에만)
         cal_key = result.get("calendar")
-        if has_all and gcal_enabled():
+        if has_all and gcal_enabled() and result.get("add_to_calendar"):
             eid, used_cal = await gcal_create(task, deadline_iso, project, cal_key)
             if eid:
                 todo["gcal_event_id"] = eid
@@ -726,13 +732,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         "last_daily_date": None,
                         "original_message": text[:200],
                     }
-                    # 캘린더 연동
-                    if gcal_enabled():
-                        cal_key = item.get("calendar")
-                        eid, used_cal = await gcal_create(task_name, deadline_iso, project, cal_key)
-                        if eid:
-                            todo["gcal_event_id"] = eid
-                            todo["gcal_cal_key"] = used_cal
+                    # 캘린더는 명시적 요청 시에만 (bulk_create에서는 등록 X)
                     STATE["todos"].append(todo)
                     created_one.append(todo)
 
@@ -799,12 +799,40 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             matched["last_daily_date"] = None
             if matched.get("gcal_event_id"):
                 await gcal_update(matched["gcal_event_id"], new_deadline, matched.get("gcal_cal_key"))
+            elif result.get("add_to_calendar") and gcal_enabled():
+                eid, used_cal = await gcal_create(
+                    matched.get("task", ""), new_deadline, matched.get("project"), result.get("calendar")
+                )
+                if eid:
+                    matched["gcal_event_id"] = eid
+                    matched["gcal_cal_key"] = used_cal
             persist()
             dl_str = format_deadline(new_deadline, now)
             await msg.reply_html(reply or f"📅 <b>{matched.get('task')}</b> 기한 변경!\n⏰ {dl_str}")
             log.info(f"[MODIFY] {matched.get('task')} → {new_deadline}")
         elif matched and not new_deadline:
-            await msg.reply_html(reply or "📅 새 기한을 알려주세요. 예: <code>금요일까지</code>")
+            # 기한 변경 없이 "캘박해줘"만 요청한 경우
+            if result.get("add_to_calendar") and gcal_enabled() and matched.get("deadline"):
+                if matched.get("gcal_event_id"):
+                    await msg.reply_html(reply or "📅 이미 캘린더에 등록되어 있어요.")
+                else:
+                    eid, used_cal = await gcal_create(
+                        matched.get("task", ""),
+                        matched["deadline"],
+                        matched.get("project"),
+                        result.get("calendar"),
+                    )
+                    if eid:
+                        matched["gcal_event_id"] = eid
+                        matched["gcal_cal_key"] = used_cal
+                        persist()
+                        label = GCAL_CONFIGS.get(used_cal, {}).get("label", "")
+                        await msg.reply_html(reply or f"📅 <b>{matched.get('task')}</b> 캘린더에 추가됨 ({label})")
+                        log.info(f"[GCAL_ADD] {matched.get('task')}")
+                    else:
+                        await msg.reply_html("❌ 캘린더 등록 실패. 로그를 확인해주세요.")
+            else:
+                await msg.reply_html(reply or "📅 새 기한을 알려주세요. 예: <code>금요일까지</code>")
         else:
             if active:
                 items = "\n".join(f"  • {t.get('task', '?')}" for t in active)
