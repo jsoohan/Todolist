@@ -1024,6 +1024,9 @@ def main():
     if ANTHROPIC_KEY: llm_status.append("Claude(폴백)")
     gcal_info = ', '.join(GCAL_CONFIGS.get(k, {}).get("label", k) for k in GCAL_CONFIGS) if GCAL_CONFIGS else "비활성"
     log.info(f"CHAT_ID: {CHAT_ID} | LLM: {', '.join(llm_status) or '비활성'} | GCal: {gcal_info}")
+    # GCal 진단
+    log.info(f"[GCAL_DIAG] CLIENT_ID={'O' if GOOGLE_CLIENT_ID else 'X'} | CLIENT_SECRET={'O' if GOOGLE_CLIENT_SECRET else 'X'} | CONFIGS={list(GCAL_CONFIGS.keys()) or 'empty'}")
+    log.info(f"[GCAL_DIAG] env GOOGLE_REFRESH_TOKEN={'O' if os.environ.get('GOOGLE_REFRESH_TOKEN') else 'X'} | GOOGLE_CAL_PERSONAL_REFRESH_TOKEN={'O' if os.environ.get('GOOGLE_CAL_PERSONAL_REFRESH_TOKEN') else 'X'} | GOOGLE_CAL_WORK_REFRESH_TOKEN={'O' if os.environ.get('GOOGLE_CAL_WORK_REFRESH_TOKEN') else 'X'}")
     log.info(f"활성 할일: {len([t for t in STATE['todos'] if t['status'] == 'active'])}건")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
