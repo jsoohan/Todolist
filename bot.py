@@ -204,6 +204,12 @@ def build_system_prompt(now: datetime) -> str:
      - 원문에 1개 할일만 있고 사용자가 "다했다" 등이면 그 할일 complete_todo.
    "이건", "이거", 주어 없는 문장 → 답장 메시지 내에서 언급된 할일.
 
+   ⚠️ **답장 컨텍스트 있을 때 안전 규칙 (매우 중요):**
+   - 답장한 메시지에 N건의 할일이 언급되어 있으면, 그 N건만 대상. 절대 다른 활성 할일을 건드리지 말 것.
+   - "삭제"라는 말이 있어도 답장한 메시지 안의 할일들에 대한 것. batch_filter: "all" 절대 사용 금지.
+   - 답장으로 삭제할 때는 batch + batch_ids (답장 메시지 안의 할일 ID들) 사용.
+   - 답장으로 1건 삭제면 delete_todo + todo_id 사용.
+
 1-1. **미완성 할일 채우기 (매우 중요):**
    ⚠️ 미완성 할일(pending_input)이 있고 사용자 메시지가 짧은 시간/날짜 표현이거나 부족 항목을 채우는 답변이면,
    반드시 "modify_todo" intent 사용하고 해당 미완성 할일의 ID를 todo_id에 포함.
@@ -248,6 +254,13 @@ def build_system_prompt(now: datetime) -> str:
    - "[🏥 팽팽클리닉]" 같은 대괄호 태그 → project 필드에 그대로.
 
 4. **batch (일괄 처리):**
+   ⚠️ **batch_filter: "all" 사용 엄격 제한 (매우 중요):**
+   - "all" 필터는 사용자가 명시적으로 "모두/전부/싹다/다/초기화" 등을 말했을 때만 사용.
+   - "삭제" 한 단어만으로 절대 "all" 필터 사용 금지.
+   - 답장 컨텍스트가 있으면 "all" 절대 금지 — 답장한 메시지 안의 항목만 대상.
+   - 불확실하면 batch_ids로 명시적으로 대상을 지정.
+   - 절대 확인 프롬프트("삭제할까요?", "정말로?") 생성 금지. 이 봇은 확인 기능 없음. 실행 or 거절만.
+
    - "할일 모두 삭제해줘" / "전부 삭제" / "초기화" → batch_action: "delete", batch_filter: "all"
    - "기한 초과된 것 다 삭제" → batch_action: "delete", batch_filter: "overdue"
    - "반복 프로젝트 전부 삭제" → batch_action: "delete", batch_filter: "recurring"
@@ -987,7 +1000,24 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if t:
                     targets.append(t)
         elif batch_filter == "all":
-            # 완료 처리 시 반복 프로젝트는 제외 (반복은 batch_filter: "recurring"으로 별도 처리)
+            # ⚠️ 안전장치: batch_filter "all"은 사용자 메시지에 명시적 키워드가 있을 때만 허용
+            explicit_all_keywords = ["모두", "전부", "싹다", "싹", "초기화", "리셋", "reset", "clear"]
+            has_explicit = any(kw in text for kw in explicit_all_keywords)
+            # 답장 컨텍스트가 있으면 "all" 금지
+            if msg.reply_to_message:
+                log.warning(f"[BATCH_SAFETY] 답장 상태에서 filter 'all' 차단: {text[:60]}")
+                await msg.reply_html(
+                    "⚠️ 답장으로 전체 삭제는 못 해요. 특정 할일을 지정하거나, 새 메시지로 명확하게 요청해주세요."
+                )
+                return
+            if not has_explicit:
+                log.warning(f"[BATCH_SAFETY] 명시적 키워드 없어 filter 'all' 차단: {text[:60]}")
+                await msg.reply_html(
+                    "⚠️ 전체 " + ("삭제" if batch_action == "delete" else "처리") +
+                    "는 위험해서 명확한 표현이 필요해요. '모두', '전부', '초기화' 같은 키워드를 써주세요."
+                )
+                return
+            # 완료 처리 시 반복 프로젝트는 제외
             if batch_action == "complete":
                 targets = [t for t in active if t.get("type") != "recurring"]
             else:
