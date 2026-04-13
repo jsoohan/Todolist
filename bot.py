@@ -135,9 +135,12 @@ def resolve_reply_context(msg) -> dict | None:
 
 def build_system_prompt(now: datetime) -> str:
     active = [t for t in STATE["todos"] if t["status"] in ("active", "pending_input")]
-    if active:
+    active_only = [t for t in active if t["status"] == "active"]
+    pending_only = [t for t in active if t["status"] == "pending_input"]
+
+    if active_only:
         lines = []
-        for t in active:
+        for t in active_only:
             if t.get("type") == "recurring":
                 rt = t.get("reminder_time", "19:00")
                 proj = f" [{t['project']}]" if t.get("project") else ""
@@ -156,6 +159,15 @@ def build_system_prompt(now: datetime) -> str:
     else:
         todo_ctx = "\n현재 활성 할일: 없음"
 
+    if pending_only:
+        plines = []
+        for t in pending_only:
+            missing = []
+            if not t.get("task"): missing.append("할일내용")
+            if not t.get("deadline"): missing.append("데드라인")
+            plines.append(f"  #{t['id']} - {t.get('task', '(미입력)')} [부족: {', '.join(missing)}] 원본:{t.get('original_message', '')[:30]}")
+        todo_ctx += "\n\n⚠️ 미완성 할일 (사용자가 이것을 채우려고 답할 수 있음):\n" + "\n".join(plines)
+
     return f"""너는 할일 관리 전문 텔레그램 봇 "할일봇"이야.
 할일 등록, 완료, 기한 변경, 삭제, 일괄 처리, 목록 확인, 장기/반복 프로젝트 관리를 담당해. 그 외 요청은 정중하게 거절.
 
@@ -172,6 +184,7 @@ def build_system_prompt(now: datetime) -> str:
   "reminder_time": "HH:MM (KST, new_recurring)",
   "deadline_raw": "데드라인 원문 (new_todo, modify_todo)",
   "deadline_iso": "YYYY-MM-DDTHH:MM:SS+09:00 또는 null",
+  "new_task": "미완성 할일 채우기용 새 task명 (modify_todo)",
   "add_to_calendar": true | false,
   "calendar": "personal" | "work" | null,
   "todo_id": "대상 #id 또는 null (단건 처리)",
@@ -187,6 +200,14 @@ def build_system_prompt(now: datetime) -> str:
    [reply_context: #ID - 할일이름] → 사용자가 특정 리마인더에 답장한 것.
    "이건", "이거", 주어 없는 문장 → reply_context의 할일.
    반드시 todo_id에 해당 ID.
+
+1-1. **미완성 할일 채우기 (매우 중요):**
+   ⚠️ 미완성 할일(pending_input)이 있고 사용자 메시지가 짧은 시간/날짜 표현이거나 부족 항목을 채우는 답변이면,
+   반드시 "modify_todo" intent 사용하고 해당 미완성 할일의 ID를 todo_id에 포함.
+   - 미완성 할일이 "피엔케이에서도 체크리스트 받기로 했어" [부족: 데드라인] 이고,
+     사용자가 "이번주" → modify_todo, todo_id=해당ID, deadline_iso=이번주 금요일 23:59
+   - 미완성 할일이 [부족: 할일내용] 이고 사용자가 내용 제공 → modify_todo, new_task=내용
+   - 절대 새 할일(new_todo)로 만들지 말 것.
 
 2. **intent 판단:**
    - 새 할일 (1회성) → "new_todo"
@@ -716,9 +737,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             created_one = []
             created_rec = []
+            # 헤더성 단어 필터 (bulk_create에서 목록 헤더가 task로 잘못 들어오는 것 방지)
+            header_blacklist = {"장기 프로젝트", "장기프로젝트", "예정", "오늘 마감", "기한 초과", "활성 할일", "반복"}
             for item in items:
                 task_name = item.get("task", "").strip()
-                if not task_name:
+                if not task_name or task_name in header_blacklist:
                     continue
                 # task 안에 [프로젝트] 형태 태그가 박혀있으면 분리
                 tag_match = re.search(r"\s*\[([^\]]+)\]\s*$", task_name)
@@ -824,27 +847,42 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif intent == "modify_todo":
         matched = None
         new_deadline = result.get("deadline_iso")
+        new_task = result.get("new_task")
         if todo_id:
             matched = find_todo_by_id(todo_id)
         if not matched and reply_todo:
             matched = reply_todo
-        active = [t for t in STATE["todos"] if t["status"] == "active"]
+        # pending_input도 매칭 대상에 포함
+        active = [t for t in STATE["todos"] if t["status"] in ("active", "pending_input")]
         if not matched:
             fuzzy = fuzzy_match_todos(text, active)
             if len(fuzzy) == 1:
                 matched = fuzzy[0]
                 log.info(f"[FUZZY] modify_todo 퍼지 매칭: {matched.get('task')}")
+        # pending_input이 단 1건이면 자동 매칭
+        if not matched:
+            pending = [t for t in STATE["todos"] if t["status"] == "pending_input"]
+            if len(pending) == 1:
+                matched = pending[0]
+                log.info(f"[AUTO_PENDING] modify_todo 자동 매칭: {matched.get('task')}")
         if not matched and len(active) == 1:
             matched = active[0]
 
-        if matched and new_deadline:
-            matched["deadline"] = new_deadline
-            matched["deadline_display"] = result.get("deadline_raw")
-            matched["last_reminded_at"] = None
-            matched["last_daily_date"] = None
-            if matched.get("gcal_event_id"):
+        if matched and (new_deadline or new_task):
+            if new_task:
+                matched["task"] = new_task
+            if new_deadline:
+                matched["deadline"] = new_deadline
+                matched["deadline_display"] = result.get("deadline_raw")
+                matched["last_reminded_at"] = None
+                matched["last_daily_date"] = None
+            # pending_input → active 승격 (task와 deadline 둘 다 있을 때)
+            if matched.get("status") == "pending_input" and matched.get("task") and matched.get("deadline"):
+                matched["status"] = "active"
+                log.info(f"[PROMOTE] pending_input → active: {matched.get('task')}")
+            if new_deadline and matched.get("gcal_event_id"):
                 await gcal_update(matched["gcal_event_id"], new_deadline, matched.get("gcal_cal_key"))
-            elif result.get("add_to_calendar") and gcal_enabled():
+            elif new_deadline and result.get("add_to_calendar") and gcal_enabled():
                 eid, used_cal = await gcal_create(
                     matched.get("task", ""), new_deadline, matched.get("project"), result.get("calendar")
                 )
@@ -852,9 +890,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     matched["gcal_event_id"] = eid
                     matched["gcal_cal_key"] = used_cal
             persist()
-            dl_str = format_deadline(new_deadline, now)
-            await msg.reply_html(reply or f"📅 <b>{matched.get('task')}</b> 기한 변경!\n⏰ {dl_str}")
-            log.info(f"[MODIFY] {matched.get('task')} → {new_deadline}")
+            dl_str = format_deadline(new_deadline, now) if new_deadline else ""
+            await msg.reply_html(reply or f"📅 <b>{matched.get('task')}</b> 업데이트!\n{dl_str}".strip())
+            log.info(f"[MODIFY] {matched.get('task')} → task={new_task}, deadline={new_deadline}")
         elif matched and not new_deadline:
             # 기한 변경 없이 "캘박해줘"만 요청한 경우
             if result.get("add_to_calendar") and gcal_enabled() and matched.get("deadline"):
