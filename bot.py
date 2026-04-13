@@ -525,10 +525,32 @@ def format_deadline(deadline_iso: str, now: datetime) -> str:
 
 
 def find_todo_by_id(todo_id: str) -> dict | None:
+    # #da4f173a 형태도 처리
+    tid = (todo_id or "").lstrip("#")
     for t in STATE["todos"]:
-        if t["id"] == todo_id and t["status"] in ("active", "pending_input"):
+        if t["id"] == tid and t["status"] in ("active", "pending_input"):
             return t
     return None
+
+
+def fuzzy_match_todos(text: str, todos: list) -> list:
+    """메시지에서 활성 할일을 키워드 매칭하여 점수순으로 반환."""
+    text_norm = re.sub(r"\s+", "", text.lower())
+    matches = []
+    for t in todos:
+        task = t.get("task", "")
+        if not task:
+            continue
+        # 2글자 이상 한글/영숫자 단어 추출
+        words = re.findall(r"[가-힣]{2,}|[a-z0-9]{2,}", task.lower())
+        score = 0
+        for w in words:
+            if w in text_norm:
+                score += len(w)
+        if score >= 2:
+            matches.append((score, t))
+    matches.sort(key=lambda x: -x[0])
+    return [t for _, t in matches]
 
 
 # ══════════════════════════════════════════════════════════
@@ -698,8 +720,14 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 task_name = item.get("task", "").strip()
                 if not task_name:
                     continue
+                # task 안에 [프로젝트] 형태 태그가 박혀있으면 분리
+                tag_match = re.search(r"\s*\[([^\]]+)\]\s*$", task_name)
+                extracted_project = None
+                if tag_match:
+                    extracted_project = tag_match.group(1).strip()
+                    task_name = task_name[:tag_match.start()].strip()
                 item_type = item.get("type", "one_time")
-                project = item.get("project") or detect_project(task_name)
+                project = item.get("project") or extracted_project or detect_project(task_name)
 
                 if item_type == "recurring":
                     todo = {
@@ -762,6 +790,17 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not matched and reply_todo:
             matched = reply_todo
         active = [t for t in STATE["todos"] if t["status"] == "active"]
+        # 퍼지 매칭: 메시지에서 키워드로 활성 할일 찾기
+        if not matched:
+            fuzzy = fuzzy_match_todos(text, active)
+            if len(fuzzy) == 1:
+                matched = fuzzy[0]
+                log.info(f"[FUZZY] complete_todo 퍼지 매칭: {matched.get('task')}")
+            elif len(fuzzy) > 1:
+                # 여러 개 후보 → 사용자에게 확인 요청
+                items = "\n".join(f"  • {t.get('task', '?')}" for t in fuzzy)
+                await msg.reply_html(f"🤔 여러 개가 매칭돼요. 어떤 거?\n\n{items}")
+                return
         if not matched and len(active) == 1:
             matched = active[0]
 
@@ -774,9 +813,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.reply_html(reply or f"✅ <b>{matched.get('task', '할일')}</b> 완료!")
             log.info(f"[DONE] {matched.get('task')}")
         else:
+            # 매칭 실패 → LLM의 성공 응답 무시, 명확한 에러 표시
             if active:
                 items = "\n".join(f"  • {t.get('task', '?')}" for t in active)
-                await msg.reply_html(reply or f"🤔 어떤 할일?\n리마인더에 답장으로 알려주세요.\n\n{items}")
+                await msg.reply_html(f"🤔 어떤 할일인지 못 찾았어요. 더 구체적으로 말씀해주세요.\n\n<b>활성 할일:</b>\n{items}")
             else:
                 await msg.reply_html("📭 활성 할일 없음.")
 
@@ -789,6 +829,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not matched and reply_todo:
             matched = reply_todo
         active = [t for t in STATE["todos"] if t["status"] == "active"]
+        if not matched:
+            fuzzy = fuzzy_match_todos(text, active)
+            if len(fuzzy) == 1:
+                matched = fuzzy[0]
+                log.info(f"[FUZZY] modify_todo 퍼지 매칭: {matched.get('task')}")
         if not matched and len(active) == 1:
             matched = active[0]
 
@@ -847,6 +892,16 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             matched = find_todo_by_id(todo_id)
         if not matched and reply_todo:
             matched = reply_todo
+        active = [t for t in STATE["todos"] if t["status"] == "active"]
+        if not matched:
+            fuzzy = fuzzy_match_todos(text, active)
+            if len(fuzzy) == 1:
+                matched = fuzzy[0]
+                log.info(f"[FUZZY] delete_todo 퍼지 매칭: {matched.get('task')}")
+            elif len(fuzzy) > 1:
+                items = "\n".join(f"  • {t.get('task', '?')}" for t in fuzzy)
+                await msg.reply_html(f"🤔 여러 개가 매칭돼요. 어떤 거?\n\n{items}")
+                return
 
         if matched:
             matched["status"] = "deleted"
@@ -857,7 +912,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.reply_html(reply or f"🗑️ <b>{matched.get('task')}</b> 삭제!")
             log.info(f"[DELETE] {matched.get('task')}")
         else:
-            await msg.reply_html(reply or "🤔 어떤 할일? 리마인더에 답장으로 알려주세요.")
+            if active:
+                items = "\n".join(f"  • {t.get('task', '?')}" for t in active)
+                await msg.reply_html(f"🤔 어떤 할일인지 못 찾았어요.\n\n{items}")
+            else:
+                await msg.reply_html("📭 활성 할일 없음.")
 
     # ── batch (일괄 처리) ──
     elif intent == "batch":
