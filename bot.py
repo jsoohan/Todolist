@@ -288,7 +288,7 @@ async def _call_gemini(system: str, user_msg: str) -> dict | None:
                     "systemInstruction": {"parts": [{"text": system}]},
                     "contents": [{"parts": [{"text": user_msg}]}],
                     "generationConfig": {
-                        "maxOutputTokens": 500,
+                        "maxOutputTokens": 2000,
                         "responseMimeType": "application/json",
                     },
                 },
@@ -323,7 +323,7 @@ async def _call_claude(system: str, user_msg: str) -> dict | None:
                 },
                 json={
                     "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 500,
+                    "max_tokens": 2000,
                     "system": system,
                     "messages": [{"role": "user", "content": user_msg}],
                 },
