@@ -196,10 +196,13 @@ def build_system_prompt(now: datetime) -> str:
 
 핵심 규칙:
 
-1. **reply_context 처리 (가장 중요):**
-   [reply_context: #ID - 할일이름] → 사용자가 특정 리마인더에 답장한 것.
-   "이건", "이거", 주어 없는 문장 → reply_context의 할일.
-   반드시 todo_id에 해당 ID.
+1. **답장(reply) 컨텍스트 처리 (가장 중요):**
+   [reply_context: #ID - 할일이름] → 사용자가 특정 리마인더에 답장한 것. 반드시 todo_id에 해당 ID.
+   [사용자가 아래 메시지에 답장함] → 답장한 메시지 원문.
+     - 원문이 리마인더/목록/등록 메시지면, 그 안에 언급된 할일들을 대화 맥락으로 판단.
+     - 원문에 여러 할일이 있고 사용자 메시지가 "이건", "첫번째", "두번째", "둘다" 등이면 원문 내 해당 항목들 매칭.
+     - 원문에 1개 할일만 있고 사용자가 "다했다" 등이면 그 할일 complete_todo.
+   "이건", "이거", 주어 없는 문장 → 답장 메시지 내에서 언급된 할일.
 
 1-1. **미완성 할일 채우기 (매우 중요):**
    ⚠️ 미완성 할일(pending_input)이 있고 사용자 메시지가 짧은 시간/날짜 표현이거나 부족 항목을 채우는 답변이면,
@@ -289,11 +292,17 @@ def build_system_prompt(now: datetime) -> str:
    - 무조건 축하하지 말 것. 사용자 메시지의 뉘앙스를 읽고 자연스럽게 반응."""
 
 
-def build_user_message(text: str, reply_todo: dict | None) -> str:
+def build_user_message(text: str, reply_todo: dict | None, reply_to_text: str | None = None) -> str:
     """사용자 메시지에 답장 컨텍스트 주입."""
+    parts = []
     if reply_todo:
-        return f"[reply_context: #{reply_todo['id']} - {reply_todo.get('task', '?')}]\n{text}"
-    return text
+        parts.append(f"[reply_context: #{reply_todo['id']} - {reply_todo.get('task', '?')}]")
+    if reply_to_text:
+        # 답장한 원문 (길면 자름)
+        excerpt = reply_to_text[:500].replace("\n", " ")
+        parts.append(f"[사용자가 아래 메시지에 답장함]\n{excerpt}")
+    parts.append(text)
+    return "\n".join(parts)
 
 
 async def _call_gemini(system: str, user_msg: str) -> dict | None:
@@ -365,13 +374,13 @@ async def _call_claude(system: str, user_msg: str) -> dict | None:
         return None
 
 
-async def ask_llm(text: str, now: datetime, reply_todo: dict | None = None) -> dict | None:
+async def ask_llm(text: str, now: datetime, reply_todo: dict | None = None, reply_to_text: str | None = None) -> dict | None:
     if not GEMINI_KEY and not ANTHROPIC_KEY:
         log.warning("API 키 없음 (GEMINI_API_KEY, ANTHROPIC_API_KEY 둘 다 미설정)")
         return None
 
     system = build_system_prompt(now)
-    user_msg = build_user_message(text, reply_todo)
+    user_msg = build_user_message(text, reply_todo, reply_to_text)
 
     # 1차: Gemini Flash (무료)
     if GEMINI_KEY:
@@ -618,11 +627,16 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── 답장 컨텍스트 조회 ──
     reply_todo = resolve_reply_context(msg)
-    if reply_todo:
-        log.info(f"[REPLY_CTX] #{reply_todo['id']} - {reply_todo.get('task', '?')}")
+    reply_to_text = None
+    if msg.reply_to_message:
+        reply_to_text = msg.reply_to_message.text or msg.reply_to_message.caption
+        if reply_todo:
+            log.info(f"[REPLY_CTX] #{reply_todo['id']} - {reply_todo.get('task', '?')}")
+        elif reply_to_text:
+            log.info(f"[REPLY_TEXT] {reply_to_text[:60]}")
 
     # ── LLM 분석 ──
-    result = await ask_llm(text, now, reply_todo=reply_todo)
+    result = await ask_llm(text, now, reply_todo=reply_todo, reply_to_text=reply_to_text)
     if not result:
         if not GEMINI_KEY and not ANTHROPIC_KEY:
             await msg.reply_html("🤖 API 키가 설정되지 않았어요. <code>GEMINI_API_KEY</code> 또는 <code>ANTHROPIC_API_KEY</code> 환경변수를 확인해주세요.")
