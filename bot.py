@@ -318,14 +318,14 @@ def build_user_message(text: str, reply_todo: dict | None, reply_to_text: str | 
     return "\n".join(parts)
 
 
-async def _call_gemini(system: str, user_msg: str) -> dict | None:
-    """Gemini Flash API 호출."""
+async def _call_gemini(system: str, user_msg: str, model: str = "gemini-2.5-flash-lite") -> dict | None:
+    """Gemini API 호출. model로 lite/flash 선택."""
     if not GEMINI_KEY:
         return None
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={GEMINI_KEY}",
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}",
                 headers={"content-type": "application/json"},
                 json={
                     "systemInstruction": {"parts": [{"text": system}]},
@@ -337,17 +337,17 @@ async def _call_gemini(system: str, user_msg: str) -> dict | None:
                 },
             )
             if resp.status_code != 200:
-                log.error(f"Gemini API {resp.status_code}: {resp.text[:500]}")
+                log.error(f"Gemini({model}) API {resp.status_code}: {resp.text[:500]}")
                 return None
             raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
             raw = re.sub(r"^```json\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
             return json.loads(raw)
     except json.JSONDecodeError as e:
-        log.error(f"Gemini JSON 파싱 실패: {e}\nraw: {raw[:300]}")
+        log.error(f"Gemini({model}) JSON 파싱 실패: {e}\nraw: {raw[:300]}")
         return None
     except Exception as e:
-        log.error(f"Gemini 호출 실패: {e}")
+        log.error(f"Gemini({model}) 호출 실패: {e}")
         return None
 
 
@@ -395,19 +395,27 @@ async def ask_llm(text: str, now: datetime, reply_todo: dict | None = None, repl
     system = build_system_prompt(now)
     user_msg = build_user_message(text, reply_todo, reply_to_text)
 
-    # 1차: Gemini Flash (무료)
+    # 1차: Gemini 2.5 Flash Lite (최저가/무료 티어, 기본)
     if GEMINI_KEY:
-        result = await _call_gemini(system, user_msg)
+        result = await _call_gemini(system, user_msg, model="gemini-2.5-flash-lite")
+        if result:
+            log.info("[LLM] Gemini Flash Lite 응답 성공")
+            return result
+        log.warning("[LLM] Gemini Lite 실패 → Gemini Flash 시도")
+
+    # 2차: Gemini 2.5 Flash (무료 티어, 별도 쿼터, 더 똑똑함)
+    if GEMINI_KEY:
+        result = await _call_gemini(system, user_msg, model="gemini-2.5-flash")
         if result:
             log.info("[LLM] Gemini Flash 응답 성공")
             return result
-        log.warning("[LLM] Gemini 실패 → Claude 폴백 시도")
+        log.warning("[LLM] Gemini Flash 실패 → Claude 폴백 시도")
 
-    # 2차: Claude (유료 폴백)
+    # 3차: Claude Haiku (유료 최종 폴백)
     if ANTHROPIC_KEY:
         result = await _call_claude(system, user_msg)
         if result:
-            log.info("[LLM] Claude 폴백 응답 성공")
+            log.info("[LLM] Claude Haiku 폴백 응답 성공")
             return result
 
     return None
@@ -1274,8 +1282,8 @@ async def cleanup_job(ctx: ContextTypes.DEFAULT_TYPE):
 def main():
     log.info("=== 할일봇 v2 시작 ===")
     llm_status = []
-    if GEMINI_KEY: llm_status.append("Gemini(주)")
-    if ANTHROPIC_KEY: llm_status.append("Claude(폴백)")
+    if GEMINI_KEY: llm_status.append("Gemini Lite→Flash")
+    if ANTHROPIC_KEY: llm_status.append("Claude(최종 폴백)")
     gcal_info = ', '.join(GCAL_CONFIGS.get(k, {}).get("label", k) for k in GCAL_CONFIGS) if GCAL_CONFIGS else "비활성"
     log.info(f"CHAT_ID: {CHAT_ID} | LLM: {', '.join(llm_status) or '비활성'} | GCal: {gcal_info}")
     # GCal 진단
