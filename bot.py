@@ -318,10 +318,21 @@ def build_user_message(text: str, reply_todo: dict | None, reply_to_text: str | 
     return "\n".join(parts)
 
 
+def _parse_llm_json(raw: str, label: str) -> dict | None:
+    """LLM 응답 텍스트에서 JSON 추출 및 파싱."""
+    try:
+        raw = re.sub(r"^```json\s*", "", raw.strip())
+        raw = re.sub(r"\s*```$", "", raw)
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        log.error(f"{label} JSON 파싱 실패: {e}\nraw: {raw[:300]}")
+        return None
+
+
 async def _call_gemini(system: str, user_msg: str, model: str = "gemini-2.5-flash-lite") -> dict | None:
-    """Gemini API 호출. model로 lite/flash 선택."""
     if not GEMINI_KEY:
         return None
+    label = f"Gemini({model})"
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
@@ -337,24 +348,19 @@ async def _call_gemini(system: str, user_msg: str, model: str = "gemini-2.5-flas
                 },
             )
             if resp.status_code != 200:
-                log.error(f"Gemini({model}) API {resp.status_code}: {resp.text[:500]}")
+                log.error(f"{label} API {resp.status_code}: {resp.text[:500]}")
                 return None
-            raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-            raw = re.sub(r"^```json\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            return json.loads(raw)
-    except json.JSONDecodeError as e:
-        log.error(f"Gemini({model}) JSON 파싱 실패: {e}\nraw: {raw[:300]}")
-        return None
+            raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+            return _parse_llm_json(raw, label)
     except Exception as e:
-        log.error(f"Gemini({model}) 호출 실패: {e}")
+        log.error(f"{label} 호출 실패: {e}")
         return None
 
 
 async def _call_claude(system: str, user_msg: str) -> dict | None:
-    """Claude API 호출."""
     if not ANTHROPIC_KEY:
         return None
+    label = "Claude"
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
@@ -372,18 +378,13 @@ async def _call_claude(system: str, user_msg: str) -> dict | None:
                 },
             )
             if resp.status_code != 200:
-                log.error(f"Claude API {resp.status_code}: {resp.text[:500]}")
+                log.error(f"{label} API {resp.status_code}: {resp.text[:500]}")
                 return None
             content = resp.json().get("content", [])
-            raw = "".join(c.get("text", "") for c in content).strip()
-            raw = re.sub(r"^```json\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            return json.loads(raw)
-    except json.JSONDecodeError as e:
-        log.error(f"Claude JSON 파싱 실패: {e}\nraw: {raw[:300]}")
-        return None
+            raw = "".join(c.get("text", "") for c in content)
+            return _parse_llm_json(raw, label)
     except Exception as e:
-        log.error(f"Claude 호출 실패: {e}")
+        log.error(f"{label} 호출 실패: {e}")
         return None
 
 
@@ -438,11 +439,22 @@ def _resolve_cal(cal_key: str | None) -> dict | None:
     return next(iter(GCAL_CONFIGS.values()))
 
 
-async def _gcal_token(cal_key: str | None = None) -> tuple[str | None, str | None]:
-    """Refresh token으로 access token 획득. (token, calendar_id) 반환."""
+# Access token 캐시: cal_key -> (token, expires_at)
+_GCAL_TOKEN_CACHE: dict[str, tuple[str, datetime]] = {}
+GCAL_TOKEN_TTL = 3300  # 55분
+
+
+async def _gcal_token(cal_key: str | None = None) -> tuple[str | None, str | None, str | None]:
+    """Refresh token으로 access token 획득. (token, calendar_id, resolved_key) 반환. 55분 캐시."""
     cfg = _resolve_cal(cal_key)
     if not cfg or not GOOGLE_CLIENT_ID:
-        return None, None
+        return None, None, None
+    resolved_key = cal_key if (cal_key and cal_key in GCAL_CONFIGS) else next(iter(GCAL_CONFIGS))
+
+    cached = _GCAL_TOKEN_CACHE.get(resolved_key)
+    if cached and cached[1] > datetime.now(KST):
+        return cached[0], cfg["calendar_id"], resolved_key
+
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
@@ -455,89 +467,90 @@ async def _gcal_token(cal_key: str | None = None) -> tuple[str | None, str | Non
                 },
             )
             if resp.status_code == 200:
-                return resp.json()["access_token"], cfg["calendar_id"]
+                token = resp.json()["access_token"]
+                _GCAL_TOKEN_CACHE[resolved_key] = (token, datetime.now(KST) + timedelta(seconds=GCAL_TOKEN_TTL))
+                return token, cfg["calendar_id"], resolved_key
             log.error(f"[GCAL] 토큰 갱신 실패: {resp.status_code}")
     except Exception as e:
         log.error(f"[GCAL] 토큰 갱신 오류: {e}")
+    return None, None, None
+
+
+def _gcal_event_body(task: str, deadline_iso: str, project: str | None = None) -> dict:
+    dl = datetime.fromisoformat(deadline_iso)
+    body = {
+        "summary": task,
+        "start": {"dateTime": deadline_iso, "timeZone": "Asia/Seoul"},
+        "end": {"dateTime": (dl + timedelta(minutes=30)).isoformat(), "timeZone": "Asia/Seoul"},
+        "reminders": {"useDefault": False},
+    }
+    if project:
+        body["description"] = f"📁 {project}"
+    return body
+
+
+async def _gcal_request(method: str, path_suffix: str, cal_key: str | None, json_body: dict | None = None) -> tuple[dict | None, str | None]:
+    """GCal API 공통 호출. (json response, resolved_key) 반환. 실패 시 (None, None)."""
+    token, cal_id, resolved_key = await _gcal_token(cal_key)
+    if not token:
+        return None, None
+    url = f"https://www.googleapis.com/calendar/v3/calendars/{cal_id}/events{path_suffix}"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.request(
+                method, url,
+                headers={"Authorization": f"Bearer {token}"},
+                json=json_body,
+            )
+            if resp.status_code in (200, 204):
+                return (resp.json() if resp.content else {}), resolved_key
+            log.error(f"[GCAL] {method} {path_suffix} 실패: {resp.status_code}: {resp.text[:300]}")
+    except Exception as e:
+        log.error(f"[GCAL] {method} {path_suffix} 오류: {e}")
     return None, None
 
 
 async def gcal_create(task: str, deadline_iso: str, project: str | None = None, cal_key: str | None = None) -> tuple[str | None, str | None]:
     """캘린더 이벤트 생성 → (event_id, cal_key) 반환."""
-    token, cal_id = await _gcal_token(cal_key)
-    if not token:
-        return None, None
-    resolved_key = cal_key if cal_key and cal_key in GCAL_CONFIGS else next(iter(GCAL_CONFIGS))
-    try:
-        dl = datetime.fromisoformat(deadline_iso)
-        event = {
-            "summary": task,
-            "start": {"dateTime": deadline_iso, "timeZone": "Asia/Seoul"},
-            "end": {"dateTime": (dl + timedelta(minutes=30)).isoformat(), "timeZone": "Asia/Seoul"},
-            "reminders": {"useDefault": False},
-        }
-        if project:
-            event["description"] = f"📁 {project}"
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                f"https://www.googleapis.com/calendar/v3/calendars/{cal_id}/events",
-                headers={"Authorization": f"Bearer {token}"},
-                json=event,
-            )
-            if resp.status_code == 200:
-                eid = resp.json()["id"]
-                label = GCAL_CONFIGS[resolved_key]["label"]
-                log.info(f"[GCAL] 생성({label}): {task} → {eid}")
-                return eid, resolved_key
-            log.error(f"[GCAL] 생성 실패: {resp.status_code}: {resp.text[:300]}")
-    except Exception as e:
-        log.error(f"[GCAL] 생성 오류: {e}")
+    data, resolved_key = await _gcal_request("POST", "", cal_key, _gcal_event_body(task, deadline_iso, project))
+    if data and resolved_key:
+        eid = data.get("id")
+        log.info(f"[GCAL] 생성({GCAL_CONFIGS[resolved_key]['label']}): {task} → {eid}")
+        return eid, resolved_key
     return None, None
 
 
 async def gcal_delete(event_id: str, cal_key: str | None = None) -> bool:
     """캘린더 이벤트 삭제."""
-    token, cal_id = await _gcal_token(cal_key)
-    if not token or not event_id:
+    if not event_id:
         return False
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.delete(
-                f"https://www.googleapis.com/calendar/v3/calendars/{cal_id}/events/{event_id}",
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            if resp.status_code in (200, 204):
-                log.info(f"[GCAL] 삭제: {event_id}")
-                return True
-            log.error(f"[GCAL] 삭제 실패: {resp.status_code}")
-    except Exception as e:
-        log.error(f"[GCAL] 삭제 오류: {e}")
+    data, _ = await _gcal_request("DELETE", f"/{event_id}", cal_key)
+    if data is not None:
+        log.info(f"[GCAL] 삭제: {event_id}")
+        return True
     return False
 
 
 async def gcal_update(event_id: str, deadline_iso: str, cal_key: str | None = None) -> bool:
     """캘린더 이벤트 시간 수정."""
-    token, cal_id = await _gcal_token(cal_key)
-    if not token or not event_id:
+    if not event_id:
         return False
-    try:
-        dl = datetime.fromisoformat(deadline_iso)
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.patch(
-                f"https://www.googleapis.com/calendar/v3/calendars/{cal_id}/events/{event_id}",
-                headers={"Authorization": f"Bearer {token}"},
-                json={
-                    "start": {"dateTime": deadline_iso, "timeZone": "Asia/Seoul"},
-                    "end": {"dateTime": (dl + timedelta(minutes=30)).isoformat(), "timeZone": "Asia/Seoul"},
-                },
-            )
-            if resp.status_code == 200:
-                log.info(f"[GCAL] 수정: {event_id}")
-                return True
-            log.error(f"[GCAL] 수정 실패: {resp.status_code}")
-    except Exception as e:
-        log.error(f"[GCAL] 수정 오류: {e}")
+    dl = datetime.fromisoformat(deadline_iso)
+    body = {
+        "start": {"dateTime": deadline_iso, "timeZone": "Asia/Seoul"},
+        "end": {"dateTime": (dl + timedelta(minutes=30)).isoformat(), "timeZone": "Asia/Seoul"},
+    }
+    data, _ = await _gcal_request("PATCH", f"/{event_id}", cal_key, body)
+    if data is not None:
+        log.info(f"[GCAL] 수정: {event_id}")
+        return True
     return False
+
+
+async def maybe_gcal_delete_for(todo: dict) -> None:
+    """todo에 gcal_event_id가 있으면 삭제."""
+    if todo.get("gcal_event_id"):
+        await gcal_delete(todo["gcal_event_id"], todo.get("gcal_cal_key"))
 
 
 # ══════════════════════════════════════════════════════════
@@ -592,7 +605,6 @@ def fuzzy_match_todos(text: str, todos: list) -> list:
         task = t.get("task", "")
         if not task:
             continue
-        # 2글자 이상 한글/영숫자 단어 추출
         words = re.findall(r"[가-힣]{2,}|[a-z0-9]{2,}", task.lower())
         score = 0
         for w in words:
@@ -602,6 +614,35 @@ def fuzzy_match_todos(text: str, todos: list) -> list:
             matches.append((score, t))
     matches.sort(key=lambda x: -x[0])
     return [t for _, t in matches]
+
+
+def resolve_target_todo(
+    todo_id: str | None,
+    reply_todo: dict | None,
+    text: str,
+    statuses: tuple[str, ...] = ("active",),
+) -> tuple[dict | None, list]:
+    """
+    핸들러 공통: todo_id → reply_todo → 퍼지 매칭 → 단일 매칭 순으로 찾기.
+    (matched, ambiguous_candidates) 반환.
+    - matched: 확정된 할일 (없으면 None)
+    - ambiguous_candidates: 퍼지 매칭 결과가 2개 이상일 때 후보 목록
+    """
+    if todo_id:
+        m = find_todo_by_id(todo_id)
+        if m:
+            return m, []
+    if reply_todo:
+        return reply_todo, []
+    pool = [t for t in STATE["todos"] if t["status"] in statuses]
+    fuzzy = fuzzy_match_todos(text, pool)
+    if len(fuzzy) == 1:
+        return fuzzy[0], []
+    if len(fuzzy) > 1:
+        return None, fuzzy
+    if len(pool) == 1:
+        return pool[0], []
+    return None, []
 
 
 # ══════════════════════════════════════════════════════════
@@ -842,36 +883,21 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── complete_todo ──
     elif intent == "complete_todo":
-        matched = None
-        if todo_id:
-            matched = find_todo_by_id(todo_id)
-        if not matched and reply_todo:
-            matched = reply_todo
-        active = [t for t in STATE["todos"] if t["status"] == "active"]
-        # 퍼지 매칭: 메시지에서 키워드로 활성 할일 찾기
-        if not matched:
-            fuzzy = fuzzy_match_todos(text, active)
-            if len(fuzzy) == 1:
-                matched = fuzzy[0]
-                log.info(f"[FUZZY] complete_todo 퍼지 매칭: {matched.get('task')}")
-            elif len(fuzzy) > 1:
-                # 여러 개 후보 → 사용자에게 확인 요청
-                items = "\n".join(f"  • {t.get('task', '?')}" for t in fuzzy)
-                await msg.reply_html(f"🤔 여러 개가 매칭돼요. 어떤 거?\n\n{items}")
-                return
-        if not matched and len(active) == 1:
-            matched = active[0]
+        matched, ambiguous = resolve_target_todo(todo_id, reply_todo, text)
+        if ambiguous:
+            items = "\n".join(f"  • {t.get('task', '?')}" for t in ambiguous)
+            await msg.reply_html(f"🤔 여러 개가 매칭돼요. 어떤 거?\n\n{items}")
+            return
 
         if matched:
             matched["status"] = "done"
             matched["done_at"] = now.isoformat()
-            if matched.get("gcal_event_id"):
-                await gcal_delete(matched["gcal_event_id"], matched.get("gcal_cal_key"))
+            await maybe_gcal_delete_for(matched)
             persist()
             await msg.reply_html(reply or f"✅ <b>{matched.get('task', '할일')}</b> 완료!")
             log.info(f"[DONE] {matched.get('task')}")
         else:
-            # 매칭 실패 → LLM의 성공 응답 무시, 명확한 에러 표시
+            active = [t for t in STATE["todos"] if t["status"] == "active"]
             if active:
                 items = "\n".join(f"  • {t.get('task', '?')}" for t in active)
                 await msg.reply_html(f"🤔 어떤 할일인지 못 찾았어요. 더 구체적으로 말씀해주세요.\n\n<b>활성 할일:</b>\n{items}")
@@ -960,31 +986,21 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── delete_todo ──
     elif intent == "delete_todo":
-        matched = None
-        if todo_id:
-            matched = find_todo_by_id(todo_id)
-        if not matched and reply_todo:
-            matched = reply_todo
-        active = [t for t in STATE["todos"] if t["status"] == "active"]
-        if not matched:
-            fuzzy = fuzzy_match_todos(text, active)
-            if len(fuzzy) == 1:
-                matched = fuzzy[0]
-                log.info(f"[FUZZY] delete_todo 퍼지 매칭: {matched.get('task')}")
-            elif len(fuzzy) > 1:
-                items = "\n".join(f"  • {t.get('task', '?')}" for t in fuzzy)
-                await msg.reply_html(f"🤔 여러 개가 매칭돼요. 어떤 거?\n\n{items}")
-                return
+        matched, ambiguous = resolve_target_todo(todo_id, reply_todo, text)
+        if ambiguous:
+            items = "\n".join(f"  • {t.get('task', '?')}" for t in ambiguous)
+            await msg.reply_html(f"🤔 여러 개가 매칭돼요. 어떤 거?\n\n{items}")
+            return
 
         if matched:
             matched["status"] = "deleted"
             matched["done_at"] = now.isoformat()
-            if matched.get("gcal_event_id"):
-                await gcal_delete(matched["gcal_event_id"], matched.get("gcal_cal_key"))
+            await maybe_gcal_delete_for(matched)
             persist()
             await msg.reply_html(reply or f"🗑️ <b>{matched.get('task')}</b> 삭제!")
             log.info(f"[DELETE] {matched.get('task')}")
         else:
+            active = [t for t in STATE["todos"] if t["status"] == "active"]
             if active:
                 items = "\n".join(f"  • {t.get('task', '?')}" for t in active)
                 await msg.reply_html(f"🤔 어떤 할일인지 못 찾았어요.\n\n{items}")
@@ -1039,23 +1055,26 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.reply_html(reply or "🤔 대상 할일을 찾지 못했어요.")
         else:
             names = []
+            gcal_deletes = []
             for t in targets:
                 if batch_action == "delete":
                     t["status"] = "deleted"
                     t["done_at"] = now.isoformat()
                     if t.get("gcal_event_id"):
-                        await gcal_delete(t["gcal_event_id"], t.get("gcal_cal_key"))
+                        gcal_deletes.append(maybe_gcal_delete_for(t))
                 elif batch_action == "complete":
                     t["status"] = "done"
                     t["done_at"] = now.isoformat()
                     if t.get("gcal_event_id"):
-                        await gcal_delete(t["gcal_event_id"], t.get("gcal_cal_key"))
+                        gcal_deletes.append(maybe_gcal_delete_for(t))
                 elif batch_action == "modify" and new_deadline:
                     t["deadline"] = new_deadline
                     t["deadline_display"] = result.get("deadline_raw")
                     t["last_reminded_at"] = None
                     t["last_daily_date"] = None
                 names.append(t.get("task", "?"))
+            if gcal_deletes:
+                await asyncio.gather(*gcal_deletes, return_exceptions=True)
             persist()
 
             action_emoji = {"delete": "🗑️", "complete": "✅", "modify": "📅"}.get(batch_action, "✅")
@@ -1084,10 +1103,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def get_reminder_interval(deadline_iso: str, now: datetime) -> float | None:
     try:
         remaining = (datetime.fromisoformat(deadline_iso) - now).total_seconds() / 3600
-        if remaining <= 0: return 3.0
-        elif remaining <= 12: return 3.0
-        elif remaining <= 24: return 4.0
-        else: return None
+        if remaining <= 12: return 3.0
+        if remaining <= 24: return 4.0
+        return None
     except Exception:
         return None
 
@@ -1142,6 +1160,7 @@ async def reminder_check(ctx: ContextTypes.DEFAULT_TYPE):
             pending_due.append(todo)
 
     # ── 2단계: 통합 발송 ──
+    state_dirty = False
 
     # 반복 프로젝트 → 1개 메시지로 통합
     if recurring_due:
@@ -1153,16 +1172,15 @@ async def reminder_check(ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"\n⏰ 매일 {rt} 반복 · {len(recurring_due)}건")
         lines.append(f"\n<i>↩️ 답장: '1번 다했다' / '헬스케어 그만해'</i>")
 
-        sent = await ctx.bot.send_message(
+        await ctx.bot.send_message(
             chat_id=CHAT_ID, text="\n".join(lines), parse_mode="HTML",
         )
         for todo in recurring_due:
             todo["last_reminded_at"] = now.isoformat()
             todo["last_daily_date"] = today
-        persist()
+        state_dirty = True
         log.info(f"[REMIND_RECURRING] {len(recurring_due)}건 통합 발송")
 
-    # 데드라인 할일 → 1건이면 개별, 2건 이상이면 통합
     if deadline_due:
         if len(deadline_due) == 1:
             todo = deadline_due[0]
@@ -1181,10 +1199,9 @@ async def reminder_check(ctx: ContextTypes.DEFAULT_TYPE):
             todo["last_reminded_at"] = now.isoformat()
             todo["last_daily_date"] = today
             STATE.setdefault("reminder_msg_map", {})[str(sent.message_id)] = todo["id"]
-            persist()
+            state_dirty = True
             log.info(f"[REMIND] {todo['task']}")
         else:
-            # 다건 통합
             deadline_due.sort(key=lambda t: datetime.fromisoformat(t["deadline"]))
             lines = [f"⏰ <b>리마인더</b> ({len(deadline_due)}건)\n"]
             for todo in deadline_due:
@@ -1193,25 +1210,30 @@ async def reminder_check(ctx: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"  📌 {todo['task']}{proj}\n    {dl_str}")
             lines.append(f"\n<i>↩️ 답장: '증권거래세 다했다' / '코엑스 금요일까지'</i>")
 
-            sent = await ctx.bot.send_message(
+            await ctx.bot.send_message(
                 chat_id=CHAT_ID, text="\n".join(lines), parse_mode="HTML",
             )
             for todo in deadline_due:
                 todo["last_reminded_at"] = now.isoformat()
                 todo["last_daily_date"] = today
-            persist()
+            state_dirty = True
             log.info(f"[REMIND] {len(deadline_due)}건 통합 발송")
 
-    # 미완성 입력
-    for todo in pending_due:
-        missing = []
-        if not todo.get("task"): missing.append("할일 내용")
-        if not todo.get("deadline"): missing.append("데드라인")
-        await ctx.bot.send_message(
-            chat_id=CHAT_ID, parse_mode="HTML",
-            text=f"⚠️ <b>입력 미완성</b>\n원본: <code>{todo.get('original_message', '?')}</code>\n부족: {', '.join(missing)}",
-        )
-        todo["last_reminded_at"] = now.isoformat()
+    # 미완성 입력 (병렬 전송)
+    if pending_due:
+        async def _send_pending(todo):
+            missing = []
+            if not todo.get("task"): missing.append("할일 내용")
+            if not todo.get("deadline"): missing.append("데드라인")
+            await ctx.bot.send_message(
+                chat_id=CHAT_ID, parse_mode="HTML",
+                text=f"⚠️ <b>입력 미완성</b>\n원본: <code>{todo.get('original_message', '?')}</code>\n부족: {', '.join(missing)}",
+            )
+            todo["last_reminded_at"] = now.isoformat()
+        await asyncio.gather(*(_send_pending(t) for t in pending_due), return_exceptions=True)
+        state_dirty = True
+
+    if state_dirty:
         persist()
 
 
