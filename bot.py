@@ -1270,11 +1270,12 @@ async def reminder_check(ctx: ContextTypes.DEFAULT_TYPE):
             missing = []
             if not todo.get("task"): missing.append("할일 내용")
             if not todo.get("deadline"): missing.append("데드라인")
-            await ctx.bot.send_message(
+            sent = await ctx.bot.send_message(
                 chat_id=CHAT_ID, parse_mode="HTML",
                 text=f"⚠️ <b>입력 미완성</b>\n원본: <code>{todo.get('original_message', '?')}</code>\n부족: {', '.join(missing)}",
             )
             todo["last_reminded_at"] = now.isoformat()
+            STATE.setdefault("reminder_msg_map", {})[str(sent.message_id)] = todo["id"]
         await asyncio.gather(*(_send_pending(t) for t in pending_due), return_exceptions=True)
         state_dirty = True
 
