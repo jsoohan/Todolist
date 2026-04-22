@@ -204,6 +204,13 @@ def build_system_prompt(now: datetime) -> str:
      - 원문에 1개 할일만 있고 사용자가 "다했다" 등이면 그 할일 complete_todo.
    "이건", "이거", 주어 없는 문장 → 답장 메시지 내에서 언급된 할일.
 
+   ⚠️ **번호 참조 (매우 중요):**
+   - 답장한 원문에 "1. ...", "2. ..." 같은 번호가 있고 사용자가 "1번", "2번 완료", "1,3번 삭제", "2번 금요일까지" 등을 말하면
+     원문의 해당 번호 항목을 정확히 매칭. 번호 = 원문의 리스트 순서.
+   - 복수 번호("1,3번" / "1과 3" / "1번, 3번") → batch + batch_ids (해당 항목들의 ID)
+   - 단일 번호("2번 완료") → complete_todo + todo_id (해당 항목 ID)
+   - 번호 + 기한("1번 내일까지") → modify_todo + todo_id + deadline_iso
+
    ⚠️ **답장 컨텍스트 있을 때 안전 규칙 (매우 중요):**
    - 답장한 메시지에 N건의 할일이 언급되어 있으면, 그 N건만 대상. 절대 다른 활성 할일을 건드리지 말 것.
    - "삭제"라는 말이 있어도 답장한 메시지 안의 할일들에 대한 것. batch_filter: "all" 절대 사용 금지.
@@ -904,7 +911,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not reply_todo and not todo_id and is_bare_word(text, BARE_COMPLETE_WORDS):
             pool = [t for t in STATE["todos"] if t["status"] in ("active", "pending_input")]
             if pool:
-                items = "\n".join(f"  • {t.get('task', '?')}" for t in pool)
+                items = "\n".join(f"  {i}. {t.get('task', '?')}" for i, t in enumerate(pool, 1))
                 await msg.reply_html(
                     f"🤔 어떤 할일을 완료하시나요?\n리마인더에 답장하거나 할일 이름을 포함해주세요.\n\n{items}"
                 )
@@ -913,7 +920,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         matched, ambiguous = resolve_target_todo(todo_id, reply_todo, text, statuses=("active", "pending_input"))
         if ambiguous:
-            items = "\n".join(f"  • {t.get('task', '?')}" for t in ambiguous)
+            items = "\n".join(f"  {i}. {t.get('task', '?')}" for i, t in enumerate(ambiguous, 1))
             await msg.reply_html(f"🤔 여러 개가 매칭돼요. 어떤 거?\n\n{items}")
             return
 
@@ -927,7 +934,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             active = [t for t in STATE["todos"] if t["status"] == "active"]
             if active:
-                items = "\n".join(f"  • {t.get('task', '?')}" for t in active)
+                items = "\n".join(f"  {i}. {t.get('task', '?')}" for i, t in enumerate(active, 1))
                 await msg.reply_html(f"🤔 어떤 할일인지 못 찾았어요. 더 구체적으로 말씀해주세요.\n\n<b>활성 할일:</b>\n{items}")
             else:
                 await msg.reply_html("📭 활성 할일 없음.")
@@ -1007,7 +1014,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await msg.reply_html(reply or "📅 새 기한을 알려주세요. 예: <code>금요일까지</code>")
         else:
             if active:
-                items = "\n".join(f"  • {t.get('task', '?')}" for t in active)
+                items = "\n".join(f"  {i}. {t.get('task', '?')}" for i, t in enumerate(active, 1))
                 await msg.reply_html(reply or f"🤔 어떤 할일?\n리마인더에 답장으로 알려주세요.\n\n{items}")
             else:
                 await msg.reply_html("📭 활성 할일 없음.")
@@ -1017,7 +1024,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not reply_todo and not todo_id and is_bare_word(text, BARE_DELETE_WORDS):
             pool = [t for t in STATE["todos"] if t["status"] in ("active", "pending_input")]
             if pool:
-                items = "\n".join(f"  • {t.get('task', '?')}" for t in pool)
+                items = "\n".join(f"  {i}. {t.get('task', '?')}" for i, t in enumerate(pool, 1))
                 await msg.reply_html(
                     f"🤔 어떤 할일을 삭제하시나요?\n리마인더에 답장하거나 할일 이름을 포함해주세요.\n\n{items}"
                 )
@@ -1026,7 +1033,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         matched, ambiguous = resolve_target_todo(todo_id, reply_todo, text, statuses=("active", "pending_input"))
         if ambiguous:
-            items = "\n".join(f"  • {t.get('task', '?')}" for t in ambiguous)
+            items = "\n".join(f"  {i}. {t.get('task', '?')}" for i, t in enumerate(ambiguous, 1))
             await msg.reply_html(f"🤔 여러 개가 매칭돼요. 어떤 거?\n\n{items}")
             return
 
@@ -1040,7 +1047,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             active = [t for t in STATE["todos"] if t["status"] == "active"]
             if active:
-                items = "\n".join(f"  • {t.get('task', '?')}" for t in active)
+                items = "\n".join(f"  {i}. {t.get('task', '?')}" for i, t in enumerate(active, 1))
                 await msg.reply_html(f"🤔 어떤 할일인지 못 찾았어요.\n\n{items}")
             else:
                 await msg.reply_html("📭 활성 할일 없음.")
@@ -1242,11 +1249,11 @@ async def reminder_check(ctx: ContextTypes.DEFAULT_TYPE):
         else:
             deadline_due.sort(key=lambda t: datetime.fromisoformat(t["deadline"]))
             lines = [f"⏰ <b>리마인더</b> ({len(deadline_due)}건)\n"]
-            for todo in deadline_due:
+            for i, todo in enumerate(deadline_due, 1):
                 dl_str = format_deadline(todo["deadline"], now)
                 proj = f" [{todo['project']}]" if todo.get("project") else ""
-                lines.append(f"  📌 {todo['task']}{proj}\n    {dl_str}")
-            lines.append(f"\n<i>↩️ 답장: '증권거래세 다했다' / '코엑스 금요일까지'</i>")
+                lines.append(f"  <b>{i}.</b> {todo['task']}{proj}\n    {dl_str}")
+            lines.append(f"\n<i>↩️ 답장: '1번 다했다' / '2번 금요일까지' / '1,3번 완료'</i>")
 
             await ctx.bot.send_message(
                 chat_id=CHAT_ID, text="\n".join(lines), parse_mode="HTML",
@@ -1293,6 +1300,7 @@ async def send_summary(bot, now: datetime, force: bool = False):
     wday = WEEKDAYS_KR[now.weekday()]
     lines = [f"📋 <b>오늘의 할일 ({now.month}/{now.day} {wday})</b>\n"]
 
+    counter = 0
     if one_time:
         overdue = [t for t in one_time if t.get("deadline") and datetime.fromisoformat(t["deadline"]) < now]
         today_end = now.replace(hour=23, minute=59, second=59)
@@ -1303,19 +1311,21 @@ async def send_summary(bot, now: datetime, force: bool = False):
             if not group: continue
             lines.append(f"<b>{label}:</b>")
             for t in group:
+                counter += 1
                 proj = f" [{t['project']}]" if t.get("project") else ""
                 task = t.get("task", "(미입력)")
                 dl = format_deadline(t["deadline"], now) if t.get("deadline") else "⚠️ 데드라인 미설정"
-                lines.append(f"  • {task}{proj}\n    {dl}")
+                lines.append(f"  <b>{counter}.</b> {task}{proj}\n    {dl}")
             lines.append("")
 
     if recurring:
         lines.append(f"<b>🔄 장기 프로젝트 ({len(recurring)}건):</b>")
         for t in recurring:
+            counter += 1
             proj = f" [{t['project']}]" if t.get("project") else ""
             task = t.get("task", "(미입력)")
             rt = t.get("reminder_time", "19:00")
-            lines.append(f"  • {task}{proj}\n    매일 {rt} 리마인더")
+            lines.append(f"  <b>{counter}.</b> {task}{proj}\n    매일 {rt} 리마인더")
         lines.append("")
 
     lines.append(f"총 {len(active)}건 (1회성 {len(one_time)} + 반복 {len(recurring)}) | /list")
