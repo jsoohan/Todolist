@@ -166,7 +166,7 @@ def build_system_prompt(now: datetime) -> str:
             if not t.get("task"): missing.append("할일내용")
             if not t.get("deadline"): missing.append("데드라인")
             plines.append(f"  #{t['id']} - {t.get('task', '(미입력)')} [부족: {', '.join(missing)}] 원본:{t.get('original_message', '')[:30]}")
-        todo_ctx += "\n\n⚠️ 미완성 할일 (사용자가 이것을 채우려고 답할 수 있음):\n" + "\n".join(plines)
+        todo_ctx += "\n\n⚠️ 미완성 할일 (사용자가 채우려 하거나, '완료/삭제'로 치울 수도 있음):\n" + "\n".join(plines)
 
     return f"""너는 할일 관리 전문 텔레그램 봇 "할일봇"이야.
 할일 등록, 완료, 기한 변경, 삭제, 일괄 처리, 목록 확인, 장기/반복 프로젝트 관리를 담당해. 그 외 요청은 정중하게 거절.
@@ -217,6 +217,11 @@ def build_system_prompt(now: datetime) -> str:
      사용자가 "이번주" → modify_todo, todo_id=해당ID, deadline_iso=이번주 금요일 23:59
    - 미완성 할일이 [부족: 할일내용] 이고 사용자가 내용 제공 → modify_todo, new_task=내용
    - 절대 새 할일(new_todo)로 만들지 말 것.
+
+   ⚠️ **단, 완료/삭제 의도 단어는 채우기가 아니라 완료/삭제로 처리:**
+   - "완료", "다했다", "끝", "됐어" → complete_todo (todo_id에 pending_input의 ID). 절대 "완료"를 deadline으로 해석 금지.
+   - "삭제", "취소", "빼줘", "그만" → delete_todo (todo_id에 pending_input의 ID).
+   - "안해", "안할래", "필요없어" → delete_todo.
 
 2. **intent 판단:**
    - 새 할일 1건 → "new_todo"
@@ -885,7 +890,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── complete_todo ──
     elif intent == "complete_todo":
-        matched, ambiguous = resolve_target_todo(todo_id, reply_todo, text)
+        matched, ambiguous = resolve_target_todo(todo_id, reply_todo, text, statuses=("active", "pending_input"))
         if ambiguous:
             items = "\n".join(f"  • {t.get('task', '?')}" for t in ambiguous)
             await msg.reply_html(f"🤔 여러 개가 매칭돼요. 어떤 거?\n\n{items}")
@@ -988,7 +993,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── delete_todo ──
     elif intent == "delete_todo":
-        matched, ambiguous = resolve_target_todo(todo_id, reply_todo, text)
+        matched, ambiguous = resolve_target_todo(todo_id, reply_todo, text, statuses=("active", "pending_input"))
         if ambiguous:
             items = "\n".join(f"  • {t.get('task', '?')}" for t in ambiguous)
             await msg.reply_html(f"🤔 여러 개가 매칭돼요. 어떤 거?\n\n{items}")
