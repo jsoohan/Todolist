@@ -623,6 +623,16 @@ def fuzzy_match_todos(text: str, todos: list) -> list:
     return [t for _, t in matches]
 
 
+# 대상 불명확 시 위험한 단독 명령어 — 답장 컨텍스트 없이 오면 대상 확인 요청
+BARE_COMPLETE_WORDS = {"완료", "다했다", "다했어", "끝", "끝났어", "됐어", "됐음", "그만", "그만해", "중단", "done"}
+BARE_DELETE_WORDS = {"삭제", "삭제해", "취소", "취소해", "빼줘", "지워", "지워줘"}
+
+
+def is_bare_word(text: str, wordset: set) -> bool:
+    """사용자 메시지가 맥락 없는 단독 명령어인지 확인."""
+    return re.sub(r"\s+", "", text.lower()) in wordset
+
+
 def resolve_target_todo(
     todo_id: str | None,
     reply_todo: dict | None,
@@ -890,6 +900,17 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── complete_todo ──
     elif intent == "complete_todo":
+        # 답장 컨텍스트 없이 단독 '완료' 단어만 오면 대상 확인 요청
+        if not reply_todo and not todo_id and is_bare_word(text, BARE_COMPLETE_WORDS):
+            pool = [t for t in STATE["todos"] if t["status"] in ("active", "pending_input")]
+            if pool:
+                items = "\n".join(f"  • {t.get('task', '?')}" for t in pool)
+                await msg.reply_html(
+                    f"🤔 어떤 할일을 완료하시나요?\n리마인더에 답장하거나 할일 이름을 포함해주세요.\n\n{items}"
+                )
+            else:
+                await msg.reply_html("📭 활성 할일 없음.")
+            return
         matched, ambiguous = resolve_target_todo(todo_id, reply_todo, text, statuses=("active", "pending_input"))
         if ambiguous:
             items = "\n".join(f"  • {t.get('task', '?')}" for t in ambiguous)
@@ -993,6 +1014,16 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── delete_todo ──
     elif intent == "delete_todo":
+        if not reply_todo and not todo_id and is_bare_word(text, BARE_DELETE_WORDS):
+            pool = [t for t in STATE["todos"] if t["status"] in ("active", "pending_input")]
+            if pool:
+                items = "\n".join(f"  • {t.get('task', '?')}" for t in pool)
+                await msg.reply_html(
+                    f"🤔 어떤 할일을 삭제하시나요?\n리마인더에 답장하거나 할일 이름을 포함해주세요.\n\n{items}"
+                )
+            else:
+                await msg.reply_html("📭 활성 할일 없음.")
+            return
         matched, ambiguous = resolve_target_todo(todo_id, reply_todo, text, statuses=("active", "pending_input"))
         if ambiguous:
             items = "\n".join(f"  • {t.get('task', '?')}" for t in ambiguous)
