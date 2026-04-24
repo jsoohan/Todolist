@@ -103,6 +103,9 @@ def save_data(data: dict):
 
 STATE = load_data()
 
+# 최근 발송한 번호 매기기 목록 (답장 없이 "4번 완료" 같은 참조 지원)
+LAST_NUMBERED_LIST: list[str] = []  # todo ID 순서 목록
+
 
 def persist():
     save_data(STATE)
@@ -205,11 +208,12 @@ def build_system_prompt(now: datetime) -> str:
    "이건", "이거", 주어 없는 문장 → 답장 메시지 내에서 언급된 할일.
 
    ⚠️ **번호 참조 (매우 중요):**
-   - 답장한 원문에 "1. ...", "2. ..." 같은 번호가 있고 사용자가 "1번", "2번 완료", "1,3번 삭제", "2번 금요일까지" 등을 말하면
-     원문의 해당 번호 항목을 정확히 매칭. 번호 = 원문의 리스트 순서.
+   - 답장 원문 또는 [최근 번호 목록] 컨텍스트에 번호→할일 매핑이 있을 수 있음.
+   - "1번", "2번 완료", "1,3번 삭제", "2번 금요일까지" 등 → 해당 번호의 할일 ID를 매핑에서 찾아 사용.
    - 복수 번호("1,3번" / "1과 3" / "1번, 3번") → batch + batch_ids (해당 항목들의 ID)
    - 단일 번호("2번 완료") → complete_todo + todo_id (해당 항목 ID)
    - 번호 + 기한("1번 내일까지") → modify_todo + todo_id + deadline_iso
+   - 숫자만 있고 맥락 없으면: "4 완료" → 4번 할일 완료 (batch_filter "all" 사용 금지!)
 
    ⚠️ **답장 컨텍스트 있을 때 안전 규칙 (매우 중요):**
    - 답장한 메시지에 N건의 할일이 언급되어 있으면, 그 N건만 대상. 절대 다른 활성 할일을 건드리지 말 것.
@@ -325,9 +329,19 @@ def build_user_message(text: str, reply_todo: dict | None, reply_to_text: str | 
     if reply_todo:
         parts.append(f"[reply_context: #{reply_todo['id']} - {reply_todo.get('task', '?')}]")
     if reply_to_text:
-        # 답장한 원문 (길면 자름)
         excerpt = reply_to_text[:500].replace("\n", " ")
         parts.append(f"[사용자가 아래 메시지에 답장함]\n{excerpt}")
+    # 답장 없이 번호 참조 시 최근 목록 제공
+    if not reply_todo and not reply_to_text and LAST_NUMBERED_LIST:
+        if re.search(r"\d", text):
+            mapping = []
+            for i, tid in enumerate(LAST_NUMBERED_LIST, 1):
+                for t in STATE["todos"]:
+                    if t["id"] == tid and t["status"] in ("active", "pending_input"):
+                        mapping.append(f"{i}={t.get('task', '?')[:20]}(#{tid})")
+                        break
+            if mapping:
+                parts.append(f"[최근 번호 목록: {', '.join(mapping)}]")
     parts.append(text)
     return "\n".join(parts)
 
@@ -1223,6 +1237,8 @@ async def reminder_check(ctx: ContextTypes.DEFAULT_TYPE):
         for todo in recurring_due:
             todo["last_reminded_at"] = now.isoformat()
             todo["last_daily_date"] = today
+        LAST_NUMBERED_LIST.clear()
+        LAST_NUMBERED_LIST.extend(t["id"] for t in recurring_due)
         state_dirty = True
         log.info(f"[REMIND_RECURRING] {len(recurring_due)}건 통합 발송")
 
@@ -1261,6 +1277,8 @@ async def reminder_check(ctx: ContextTypes.DEFAULT_TYPE):
             for todo in deadline_due:
                 todo["last_reminded_at"] = now.isoformat()
                 todo["last_daily_date"] = today
+            LAST_NUMBERED_LIST.clear()
+            LAST_NUMBERED_LIST.extend(t["id"] for t in deadline_due)
             state_dirty = True
             log.info(f"[REMIND] {len(deadline_due)}건 통합 발송")
 
@@ -1331,6 +1349,19 @@ async def send_summary(bot, now: datetime, force: bool = False):
 
     lines.append(f"총 {len(active)}건 (1회성 {len(one_time)} + 반복 {len(recurring)}) | /list")
     await bot.send_message(chat_id=CHAT_ID, text="\n".join(lines), parse_mode="HTML")
+    # 요약에 표시된 순서를 번호 참조용으로 저장
+    if one_time or recurring:
+        ordered = []
+        if one_time:
+            overdue = [t for t in one_time if t.get("deadline") and datetime.fromisoformat(t["deadline"]) < now]
+            today_end = now.replace(hour=23, minute=59, second=59)
+            today_due = [t for t in one_time if t.get("deadline") and now <= datetime.fromisoformat(t["deadline"]) <= today_end and t not in overdue]
+            upcoming = [t for t in one_time if t not in overdue and t not in today_due]
+            for group in [overdue, today_due, upcoming]:
+                ordered.extend(t["id"] for t in group)
+        ordered.extend(t["id"] for t in recurring)
+        LAST_NUMBERED_LIST.clear()
+        LAST_NUMBERED_LIST.extend(ordered)
 
 
 async def cleanup_job(ctx: ContextTypes.DEFAULT_TYPE):
