@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import uuid
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
@@ -37,6 +38,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
+CLAUDE_CODE_AVAILABLE = bool(shutil.which("claude") and os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 
@@ -357,6 +359,45 @@ def _parse_llm_json(raw: str, label: str) -> dict | None:
         return None
 
 
+async def _call_claude_code(system: str, user_msg: str) -> dict | None:
+    """Claude Code CLI (Max 구독 크레딧) 호출."""
+    if not CLAUDE_CODE_AVAILABLE:
+        return None
+    prompt = f"""아래 시스템 지시에 따라 JSON만 출력하세요. 도구 사용 없이 JSON 텍스트만 출력.
+
+--- 시스템 지시 ---
+{system}
+
+--- 사용자 메시지 ---
+{user_msg}"""
+
+    # ANTHROPIC_API_KEY가 있으면 API 과금되므로 제거
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "-p", prompt,
+            "--output-format", "text",
+            "--dangerously-skip-permissions",
+            "--max-turns", "1",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=45)
+        if proc.returncode == 0 and stdout:
+            return _parse_llm_json(stdout.decode(), "ClaudeCode")
+        log.error(f"ClaudeCode 실패 (rc={proc.returncode}): {stderr.decode()[:300]}")
+    except asyncio.TimeoutError:
+        log.error("ClaudeCode 타임아웃 (45초)")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    except Exception as e:
+        log.error(f"ClaudeCode 오류: {e}")
+    return None
+
+
 async def _call_gemini(system: str, user_msg: str, model: str = "gemini-2.5-flash-lite") -> dict | None:
     if not GEMINI_KEY:
         return None
@@ -417,34 +458,41 @@ async def _call_claude(system: str, user_msg: str) -> dict | None:
 
 
 async def ask_llm(text: str, now: datetime, reply_todo: dict | None = None, reply_to_text: str | None = None) -> dict | None:
-    if not GEMINI_KEY and not ANTHROPIC_KEY:
-        log.warning("API 키 없음 (GEMINI_API_KEY, ANTHROPIC_API_KEY 둘 다 미설정)")
+    if not CLAUDE_CODE_AVAILABLE and not GEMINI_KEY and not ANTHROPIC_KEY:
+        log.warning("LLM 없음 (Claude Code CLI, GEMINI_API_KEY, ANTHROPIC_API_KEY 모두 미설정)")
         return None
 
     system = build_system_prompt(now)
     user_msg = build_user_message(text, reply_todo, reply_to_text)
 
-    # 1차: Gemini 2.5 Flash Lite (최저가/무료 티어, 기본)
+    # 1차: Claude Code CLI (Max 구독 크레딧, API 과금 0원)
+    if CLAUDE_CODE_AVAILABLE:
+        result = await _call_claude_code(system, user_msg)
+        if result:
+            log.info("[LLM] Claude Code CLI 응답 성공")
+            return result
+        log.warning("[LLM] Claude Code CLI 실패 → Gemini 폴백 시도")
+
+    # 2차: Gemini 2.5 Flash Lite (무료 티어)
     if GEMINI_KEY:
         result = await _call_gemini(system, user_msg, model="gemini-2.5-flash-lite")
         if result:
-            log.info("[LLM] Gemini Flash Lite 응답 성공")
+            log.info("[LLM] Gemini Flash Lite 폴백 응답 성공")
             return result
         log.warning("[LLM] Gemini Lite 실패 → Gemini Flash 시도")
 
-    # 2차: Gemini 2.5 Flash (무료 티어, 별도 쿼터, 더 똑똑함)
+    # 3차: Gemini 2.5 Flash (무료 티어, 별도 쿼터)
     if GEMINI_KEY:
         result = await _call_gemini(system, user_msg, model="gemini-2.5-flash")
         if result:
-            log.info("[LLM] Gemini Flash 응답 성공")
+            log.info("[LLM] Gemini Flash 폴백 응답 성공")
             return result
-        log.warning("[LLM] Gemini Flash 실패 → Claude 폴백 시도")
 
-    # 3차: Claude Haiku (유료 최종 폴백)
+    # 4차: Claude API (유료 최종 폴백, 있으면)
     if ANTHROPIC_KEY:
         result = await _call_claude(system, user_msg)
         if result:
-            log.info("[LLM] Claude Haiku 폴백 응답 성공")
+            log.info("[LLM] Claude API 최종 폴백 응답 성공")
             return result
 
     return None
@@ -738,8 +786,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── LLM 분석 ──
     result = await ask_llm(text, now, reply_todo=reply_todo, reply_to_text=reply_to_text)
     if not result:
-        if not GEMINI_KEY and not ANTHROPIC_KEY:
-            await msg.reply_html("🤖 API 키가 설정되지 않았어요. <code>GEMINI_API_KEY</code> 또는 <code>ANTHROPIC_API_KEY</code> 환경변수를 확인해주세요.")
+        if not CLAUDE_CODE_AVAILABLE and not GEMINI_KEY and not ANTHROPIC_KEY:
+            await msg.reply_html("🤖 LLM이 설정되지 않았어요. <code>CLAUDE_CODE_OAUTH_TOKEN</code> 또는 <code>GEMINI_API_KEY</code> 환경변수를 확인해주세요.")
         else:
             await msg.reply_html("🤖 AI 응답을 받지 못했어요. 잠시 후 다시 시도해주세요.\n<i>(서버 로그에서 원인을 확인해주세요)</i>")
         return
@@ -1384,8 +1432,9 @@ async def cleanup_job(ctx: ContextTypes.DEFAULT_TYPE):
 def main():
     log.info("=== 할일봇 v2 시작 ===")
     llm_status = []
+    if CLAUDE_CODE_AVAILABLE: llm_status.append("ClaudeCode(주)")
     if GEMINI_KEY: llm_status.append("Gemini Lite→Flash")
-    if ANTHROPIC_KEY: llm_status.append("Claude(최종 폴백)")
+    if ANTHROPIC_KEY: llm_status.append("Claude API(최종 폴백)")
     gcal_info = ', '.join(GCAL_CONFIGS.get(k, {}).get("label", k) for k in GCAL_CONFIGS) if GCAL_CONFIGS else "비활성"
     log.info(f"CHAT_ID: {CHAT_ID} | LLM: {', '.join(llm_status) or '비활성'} | GCal: {gcal_info}")
     # GCal 진단
