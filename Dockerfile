@@ -18,11 +18,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py setup_calendar.py ./
 
-# Non-root user (Claude Code has issues as root)
-RUN useradd -m botuser && chown -R botuser:botuser /app
-USER botuser
-
-# Railway volume은 /data에 마운트
 ENV DATA_DIR=/data
 
 CMD ["python", "bot.py"]
